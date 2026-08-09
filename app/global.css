@@ -1,5 +1,5 @@
 @import 'tailwindcss';
-@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/solar.css';
 @import 'fumadocs-ui/css/preset.css';
 
 html {
@@ -9,4 +9,69 @@ html {
 html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;
+}
+
+header {
+  @apply pt-5 pb-3 px-6;
+}
+
+header > div,
+header > nav {
+  @apply bg-white/70 dark:bg-white/[0.05] backdrop-blur-sm py-0.5 px-1 mx-auto border-0 rounded-2xl;
+  max-width: 1200px;
+}
+
+header a,
+header button {
+  @apply text-gray-600 dark:text-white/60;
+}
+
+header a:hover,
+header button:hover {
+  @apply text-gray-900 dark:text-white;
+}
+
+/* The docs grid reserves two flexible 1fr columns on the outer edges that
+   absorb any viewport width beyond --fd-layout-width (default 97rem/~1552px)
+   as empty margin — on a wide screen that's the gap pushing the sidebar in
+   from the browser edge. Filling it to the viewport width collapses those
+   gutters so the sidebar sits flush left. Sidebar and TOC stay at their
+   default width (268px each) — only the middle content card expands to
+   fill whatever space that leaves. */
+#nd-docs-layout {
+  --fd-layout-width: 100vw;
+}
+
+#nd-page {
+  max-width: 100%;
+}
+
+/* DocsBody renders content in a `.prose` div, but this project doesn't use
+   @tailwindcss/typography (it restyles far more than headings — tables, code
+   blocks, links — clashing with Fumadocs' own styling for those). This only
+   sizes and spaces h2-h4 in doc content, nothing else. */
+.prose :is(h2, h3, h4) {
+  font-weight: 600;
+}
+
+.prose h2 {
+  font-size: 1.75rem;
+  margin-top: 4rem;
+  margin-bottom: 1.25rem;
+}
+
+.prose h3 {
+  font-size: 1.375rem;
+  margin-top: 3rem;
+  margin-bottom: 1rem;
+}
+
+.prose h4 {
+  font-size: 1.125rem;
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+}
+
+.prose :is(h2, h3, h4):first-child {
+  margin-top: 0;
 }

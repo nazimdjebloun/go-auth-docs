@@ -4,9 +4,12 @@ import { appName, gitConfig } from './shared';
 export function baseOptions(): BaseLayoutProps {
   return {
     nav: {
-      // JSX supported
       title: appName,
+      transparentMode: 'always',
     },
     githubUrl: `https://github.com/${gitConfig.user}/${gitConfig.repo}`,
+    themeSwitch: {
+      enabled: true,
+    },
   };
 }
