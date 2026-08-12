@@ -97,6 +97,12 @@ goauth.WithSecurity(goauth.SecurityConfig{
     },
     TokenTTL:      time.Hour,          // optional, default 1h
     AllowHTTPURLs: goauth.Bool(false), // optional, default derived from Environment
+
+    RequireEmail2FA:                  false, // optional, default false — mandatory email 2FA on every password login
+    DefaultTwoFactorEnabled:          false, // optional, default false — seeds User.TwoFactorEnabled at registration
+    TwoFactorCodeTTL:                 5 * time.Minute, // optional, default 5m
+    DisableTwoFactorChallengeBinding: false, // optional, default false — binding cookie stays on
+    TwoFactorChallengeCookieName:     "_2fa_challenge", // optional, default "_2fa_challenge"
 })
 ```
 
@@ -109,6 +115,11 @@ goauth.WithSecurity(goauth.SecurityConfig{
 | `PasswordPolicy` | `domain.PasswordPolicy` | Optional | `MinLength: 8, RequireDigit: true` | Setting any one field means you're specifying the whole policy — see note below. |
 | `TokenTTL` | `time.Duration` | Optional | `1h` | Lifetime of email verification and password reset tokens. |
 | `AllowHTTPURLs` | `*bool` | Optional | derived — `true` in `EnvironmentDev`, `false` otherwise | Governs `http://` links in rendered email templates only, not transport. |
+| `RequireEmail2FA` | `bool` | Optional | `false` | Makes email 2FA mandatory for every password login (`Login`, `AdminLogin`, `Register`, invite registration). While on, `Enable`/`Disable` both reject — users cannot opt out. OAuth logins are not covered; see [Security](security.mdx). |
+| `DefaultTwoFactorEnabled` | `bool` | Optional | `false` | Seeds `User.TwoFactorEnabled` at registration (email/password only). Users can still call `Disable` to opt out — use `RequireEmail2FA` if that shouldn't be possible. |
+| `TwoFactorCodeTTL` | `time.Duration` | Optional | `5m` | Lifetime of a 2FA login code. Deliberately shorter than `VerificationCodeTTL`: a 6-digit code has ~20 fewer bits of entropy than the 8-char alphanumeric codes used elsewhere. |
+| `DisableTwoFactorChallengeBinding` | `bool` | Optional | `false` | Turns off the cookie that ties a 2FA challenge to the browser that started it. Spelled as "Disable" so the zero value is the secure one. Intended for CLI/server-to-server consumers with no browser — see [Security](security.mdx). With it set, the challenge id alone identifies the challenge, so treat it as a secret. |
+| `TwoFactorChallengeCookieName` | `string` | Optional | `_2fa_challenge` | Overrides the binding cookie name. |
 
 `PasswordPolicy` fields (`MinLength int`, `RequireUppercase bool`, `RequireDigit bool`, `RequireSpecial bool`) are all individually optional, but the struct as a whole replaces the default — if you set `RequireUppercase: true` without repeating `MinLength` or `RequireDigit`, those two are no longer applied.
 
@@ -148,6 +159,8 @@ first and echo the cookie value back in the header.
 - `allowed_origins must not contain "*" — this disables CSRF protection; list specific origins instead`.
 - `token_ttl must be positive` — hint: only reachable if `TokenTTL` was explicitly set negative; an omitted value defaults to `1h` and never reaches this check.
 - `security: DisableCSRFToken and AllowMissingCSRFHeaders cannot both be set — a cross-site request with no Origin/Referer and no token would pass; keep one of the two layers`.
+- `security: two_factor_code_ttl must be positive` — hint: only reachable via an explicit negative value; an omitted one defaults to `5m`.
+- `security: RequireEmail2FA has no effect when EnableEmailPassword is disabled — every gated path is a password path`.
 
 ## `WithSession` — Optional
 
@@ -219,9 +232,9 @@ Which signup methods are available. Login is always available regardless of thes
 goauth.WithRegistration(goauth.RegistrationConfig{
     EnableEmailPassword:      true,                  // optional, default true
     EnableOAuth:              true,                  // optional, default true
-    EnableInvite:             false,                 // optional, default false — requires a mailer if true
+    EnableInvite:             false,                 // optional, default false
     AllowPublic:              true,                  // optional, default true
-    RequireEmailVerification: false,                 // optional, default false — requires a mailer if true
+    RequireEmailVerification: false,                 // optional, default false
     InviteTTL:                7 * 24 * time.Hour,    // optional, default 7d
     VerificationCodeTTL:      15 * time.Minute,      // optional, default 15m
 })
@@ -231,9 +244,9 @@ goauth.WithRegistration(goauth.RegistrationConfig{
 |---|---|---|---|---|
 | `EnableEmailPassword` | `bool` | Optional | `true` | |
 | `EnableOAuth` | `bool` | Optional | `true` | Allows OAuth to create a new account, not just link one. |
-| `EnableInvite` | `bool` | Optional | `false` | Requires a mailer — see below. |
+| `EnableInvite` | `bool` | Optional | `false` | A mailer is required regardless — see below. |
 | `AllowPublic` | `bool` | Optional | `true` | Public (non-invite) registration is reachable at all. |
-| `RequireEmailVerification` | `bool` | Optional | `false` | Requires a mailer — see below. |
+| `RequireEmailVerification` | `bool` | Optional | `false` | A mailer is required regardless — see below. |
 | `InviteTTL` | `time.Duration` | Optional | `7d` | |
 | `VerificationCodeTTL` | `time.Duration` | Optional | `15m` | |
 
@@ -241,7 +254,7 @@ A `bool` has no "unset" state — an omitted `false` looks identical to a delibe
 
 **Expected errors**
 
-- `email: Mailer or Email config required when RequireEmailVerification or EnableInvite is enabled` — hint: call `WithMailer` or `WithEmail` too.
+- `email: Mailer or Email config required — AdminLogin always requires two-factor email delivery, and RequireEmailVerification/EnableInvite/RequireEmail2FA/DefaultTwoFactorEnabled each also need it when enabled` — hint: call `WithMailer` or `WithEmail`; see [`WithMailer` / `WithEmail` / `WithTemplates`](#withmailer--withemail--withtemplates--required) below for the `EnvironmentDev` exception.
 - `registration: invite_ttl must be positive` — hint: only reachable via an explicit negative value; an omitted one defaults to `7d`.
 - `registration: verification_code_ttl must be positive` — same hint, defaults to `15m`.
 - `registration: RequireEmailVerification has no effect when both EnableEmailPassword and EnableOAuth are disabled`.
@@ -270,9 +283,11 @@ goauth.WithOrganizations(goauth.OrganizationConfig{
 - `organizations.max_orgs_per_user must be between 0 and 100 (0 = default 100)`.
 - `organizations.invite_ttl must be positive` — hint: only reachable via an explicit negative value.
 
-## `WithMailer` / `WithEmail` / `WithTemplates` — conditionally required
+## `WithMailer` / `WithEmail` / `WithTemplates` — required
 
-A mailer is only **required** by validation when `EnableInvite` or `RequireEmailVerification` is on. Without one, features that send email but aren't gated by validation — password reset, account-deletion confirmation — fail silently: the token is created but the email is never sent, since every service checks for a nil mailer and no-ops rather than erroring. If you skip the mailer entirely, don't rely on any flow that emails a link.
+A mailer is **always required** by validation, in every environment — not just when `EnableInvite`, `RequireEmailVerification`, `RequireEmail2FA`, or `DefaultTwoFactorEnabled` is on. This is because `POST /auth/admin/login` requires two-factor email delivery unconditionally, independent of all four of those flags (see [Admin login](guides/admin.mdx#admin-login) and [Security](security.mdx#two-factor-authentication)) — so every deployment needs a working mailer whether or not it opts into any of the optional email-gated features.
+
+**Exception: `EnvironmentDev`.** If neither `WithMailer` nor `WithEmail` is set and `Environment` is `EnvironmentDev`, `NewConfig` automatically defaults to a log-only mailer (`goauth.LogMailer`) instead of erroring — emails are logged (`slog`) rather than delivered, so local development works with zero mailer setup. This default only fills in when *nothing* was configured; an explicit `WithMailer`/`WithEmail` call is never overridden. Outside `EnvironmentDev`, no default is applied — a still-unconfigured mailer is a validation error.
 
 ```go
 // Built-in SMTP transport:
@@ -288,14 +303,19 @@ goauth.WithEmail(goauth.EmailConfig{
 // Or your own implementation of port.Mailer (Resend, Postmark, SES, ...):
 goauth.WithMailer(myMailer)
 
+// Dev-only: logs emails instead of sending them. NewConfig rejects this
+// outside EnvironmentDev — it's also what EnvironmentDev defaults to
+// automatically when no mailer is configured at all.
+goauth.WithMailer(goauth.NewLogMailer(nil)) // nil logger -> slog.Default()
+
 // Optional: replace the rendered email content, not just delivery.
 goauth.WithTemplates(myTemplateProvider)
 ```
 
 | Option | Purpose | Required | Notes |
 |---|---|---|---|
-| `WithMailer(port.Mailer)` | Your own delivery implementation | Conditionally (see above) | Takes precedence over `WithEmail` if both are set. |
-| `WithEmail(EmailConfig)` | Built-in SMTP delivery | Conditionally (see above) | Ignored if `WithMailer` is also set — its fields aren't even validated in that case. |
+| `WithMailer(port.Mailer)` | Your own delivery implementation | Required (auto-defaulted to `LogMailer` in `EnvironmentDev` — see above) | Takes precedence over `WithEmail` if both are set. |
+| `WithEmail(EmailConfig)` | Built-in SMTP delivery | Required (auto-defaulted to `LogMailer` in `EnvironmentDev` — see above) | Ignored if `WithMailer` is also set — its fields aren't even validated in that case. |
 | `WithTemplates(port.TemplateProvider)` | Replace the built-in email templates | Optional | The library still renders subject/HTML/text and hands finished strings to the mailer either way — this replaces content, `WithMailer` replaces delivery. |
 
 **`EmailConfig`** (only validated when `WithEmail` is set and `WithMailer` is not)
@@ -311,7 +331,7 @@ goauth.WithTemplates(myTemplateProvider)
 
 **Expected errors**
 
-- `email: Mailer or Email config required when RequireEmailVerification or EnableInvite is enabled` (repeated from `WithRegistration` — it's the same check).
+- `email: Mailer or Email config required — AdminLogin always requires two-factor email delivery, and RequireEmailVerification/EnableInvite/RequireEmail2FA/DefaultTwoFactorEnabled each also need it when enabled` — reachable in any environment except `EnvironmentDev`, where the log-mailer default fills this in automatically.
 - `email: host is required`
 - `email: port must be between 1 and 65535, got N`
 - `email: from address is required`
@@ -335,7 +355,7 @@ type TemplateResult struct {
 }
 ```
 
-`Render` is called once per email the library sends, with one of six concrete `TemplateData` types — switch on the concrete type (or on `data.Template()`, which returns an `EmailTemplateType` string) to decide which template to render:
+`Render` is called once per email the library sends, with one of eight concrete `TemplateData` types — switch on the concrete type (or on `data.Template()`, which returns an `EmailTemplateType` string) to decide which template to render:
 
 | `TemplateData` type | `Template()` | Fields | Sent for |
 |---|---|---|---|
@@ -345,6 +365,8 @@ type TemplateResult struct {
 | `port.InviteData` | `TemplateInvite` | `AppName, InviteURL, ExpiresIn` | Invite-only signup |
 | `port.OrgInviteData` | `TemplateOrgInvite` | `AppName, OrgName, InviteURL, ExpiresIn` | Organization invite |
 | `port.DeleteAccountData` | `TemplateDeleteAccount` | `AppName, Code, ExpiresIn` | Account deletion confirmation |
+| `port.TwoFactorData` | `TemplateTwoFactor` | `AppName, Code, ExpiresIn` | 2FA login code |
+| `port.TwoFactorSuspiciousData` | `TemplateTwoFactorSuspicious` | `AppName, AttemptCount, ResetPasswordURL` | Notify-only warning after repeated wrong 2FA codes on one account — never blocks login, see [Security](security.mdx) |
 
 A minimal implementation:
 
@@ -419,7 +441,7 @@ goauth.WithRateLimitRoute("POST /auth/login", ratelimit.Rate{
 | `Enabled` | `bool` | Optional | `true` | Disabling it logs a warning at startup — it's flagged as insecure for production. |
 | `Default` | `ratelimit.Rate` | Optional | `60 requests / minute` | Fallback for any route not in `Routes`. |
 | `Routes` | `map[string]ratelimit.Rate` | Optional | a built-in table covering login, register, password reset, verification, invites, etc. | Keyed by `"METHOD /path"`. |
-| `Store` | `ratelimit.Store` | Required when you pass a `Config` with `Enabled: true` | in-memory | You only need to set this when replacing the whole config with `WithRateLimit` — skip that call and the built-in default already carries a memory store. Swap it for a distributed store (Redis, etc.) across multiple instances. |
+| `Store` | `ratelimit.Store` | Required if `Enabled` | in-memory | Swap for a distributed store (Redis, etc.) across multiple instances. |
 | `DisabledPaths` | `[]string` | Optional | none | |
 | `TrustedIPs` | `[]string` | Optional | none | IPs/CIDRs. Required if `IPAddressHeader` is set. |
 | `IPv6Subnet` | `int` | Optional | `64` | Subnet prefix length used to bucket IPv6 clients. Must be 1–128. |
