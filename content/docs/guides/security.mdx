@@ -31,8 +31,8 @@ goauth.WithSecurity(goauth.SecurityConfig{
         RequireDigit:     true,
         RequireSpecial:   false,
     },
-    TokenTTL:      time.Hour,          // optional, default 1h
-    AllowHTTPURLs: goauth.Bool(false), // optional, default derived from Environment
+    TokenTTL:      time.Hour,                      // optional, default 1h
+    AllowHTTPURLs: goauth.RequireHTTPSEmailLinks(), // optional, default derived from Environment
 })
 ```
 
@@ -44,7 +44,7 @@ goauth.WithSecurity(goauth.SecurityConfig{
 | `CSRFToken` | `*middleware.CSRFTokenConfig` | Optional | auto-created | **Overrides only** — leaving it `nil` does not disable anything. The double-submit token sits on top of origin checking, and unlike the origin header it *can't* be spoofed, since it requires a cookie value only the server issued. |
 | `PasswordPolicy` | `domain.PasswordPolicy` | Optional | `MinLength: 8, RequireDigit: true` | Checked on every path that sets a password: register, reset, set-password, and change-password below. |
 | `TokenTTL` | `time.Duration` | Optional | `1h` | Lifetime of email verification and password reset tokens. |
-| `AllowHTTPURLs` | `*bool` | Optional | derived — `true` in `EnvironmentDev`, `false` otherwise | Governs `http://` links in rendered email templates only, not transport. |
+| `AllowHTTPURLs` | `*bool` | Optional | derived — `true` in `EnvironmentDev`, `false` otherwise | Governs `http://` links in rendered email templates only, not transport. Override with `goauth.AllowPlaintextEmailLinks()` or `goauth.RequireHTTPSEmailLinks()`. |
 
 The double-submit token layer is **on in every deployment** — `New` creates a `CSRFTokenConfig` with the defaults shown whenever you leave the field `nil`, so passing the struct overrides those defaults rather than switching the layer on. Turn it off with `DisableCSRFToken: true`, which is meant for deployments with no browser clients at all. See [Configuration → `WithSecurity`](../configuration.mdx#withsecurity--required-allowedorigins) for the full treatment.
 
@@ -52,7 +52,7 @@ The double-submit token layer is **on in every deployment** — `New` creates a 
 
 | Code | Status | Cause |
 |---|---|---|
-| `weak_password` | 400 | Too short, too long (over 128 chars), or missing a required character class — the message names exactly what's missing, e.g. `Password must be at least 12 characters with an uppercase letter` |
+| `weak_password` | 400 | Too short, too long (over 72 bytes — bcrypt's own limit, not a policy choice), or missing a required character class — the message names exactly what's missing, e.g. `Password must be at least 12 characters with an uppercase letter` |
 
 **Expected `WithSecurity` errors**
 
@@ -111,7 +111,7 @@ await apiRequest(API_BASE, "PUT", "/auth/name", { name: "Ada Byron" });
 
 ## Change password
 
-### Change password — `PUT /auth/password`, `POST /auth/change-password`
+### Change password — `POST /auth/change-password`
 
 Requires the current password even though the caller is already authenticated — a stolen but still-valid session cookie shouldn't be enough on its own to take over the account's credentials. On success, every *other* session is revoked (the one making this request survives), and the CSRF cookie is rotated.
 
@@ -424,7 +424,7 @@ curl -X POST https://api.myapp.com/auth/verify-email/resend \
 #### Programmatic (Go)
 
 ```go
-auth.Services.Verify.SendVerificationByEmail(ctx, "ada@example.com") // *domain.AuthError, deliberately not surfaced to the caller by the handler
+auth.Services.Verify.SendVerificationByEmail(ctx, "ada@example.com") // error wraps a *domain.AuthError, deliberately not surfaced to the caller by the handler
 ```
 
 ---

@@ -28,7 +28,7 @@ go run github.com/nazimdjebloun/go-auth/cmd/goauth@latest seed-admin \
   --smtp-host smtp.example.com --smtp-from auth@example.com
 ```
 
-Because [admin login always requires a second factor](#admin-login), a seeded admin who can't receive email can never log in — so this command sends a **real** verification email to the address you're seeding, before writing anything to the database, and aborts with nothing written if that send fails. `--driver`, `--dsn`, and `--env` are required; `--env` is `dev`, `staging`, or `prod` and controls which mailer default applies.
+Because [admin login requires a second factor by default](#admin-login), a seeded admin who can't receive email may never be able to log in — so this command sends a **real** verification email to the address you're seeding, before writing anything to the database, and aborts with nothing written if that send fails. This check runs regardless of whether the deployment you're seeding for has set `SecurityConfig.DisableAdminTwoFactor` — the CLI has no way to know your running server's config, so it conservatively assumes the default (2FA on). `--driver`, `--dsn`, and `--env` are required; `--env` is `dev`, `staging`, or `prod` and controls which mailer default applies.
 
 That email is fixed HTML-and-text content with no app name, links, or configurable parts — it lives in `cmd/goauth/cmd/seed_admin_email.go` and, unlike the library's emails, does not go through `TemplateProvider`. A compiled CLI has no way to accept a custom provider from an operator, so there is nothing to swap.
 
@@ -67,8 +67,8 @@ Same request shape as [Login](authentication.mdx#login), but only succeeds for u
 | `email` | `string` | Required |
 | `password` | `string` | Required |
 
-<Callout type="warn" title="Admin login always requires a second factor — unconditionally, not just under RequireEmail2FA">
-  Every real `goauth.New()` deployment constructs the 2FA service internally, with no config flag that skips it, and `AdminLogin` gates on that unconditionally — independent of `SecurityConfig.RequireEmail2FA`, and independent of whether the admin account itself has `TwoFactorEnabled` set. In other words: this isn't "on by default and configurable" — there is currently no supported way to turn it off. This holds even in a deployment that never touches any 2FA setting at all, which has one concrete consequence worth knowing up front: **a mailer (`WithMailer`/`WithEmail`) is mandatory for `/auth/admin/login` to work at all**, since the second-factor code has to be emailed. `NewConfig`'s validation reflects this directly — a mailer is required unconditionally in every environment except `EnvironmentDev` (which defaults to a log-only mailer automatically if none is configured), regardless of `RequireEmailVerification`, `EnableInvite`, `RequireEmail2FA`, or `DefaultTwoFactorEnabled`. See [Configuration → WithMailer / WithEmail / WithTemplates](../configuration.mdx#withmailer--withemail--withtemplates--required), [Two-factor authentication](authentication.mdx#two-factor-authentication) for the verify step, and [Security](../security.mdx#two-factor-authentication) for the reasoning.
+<Callout type="warn" title="Admin login requires a second factor by default — independent of RequireEmail2FA">
+  Every real `goauth.New()` deployment constructs the 2FA service internally, and `AdminLogin` gates on it independent of `SecurityConfig.RequireEmail2FA`, and independent of whether the admin account itself has `TwoFactorEnabled` set — on by default, so most deployments never think about it further. This holds even in a deployment that never touches any other 2FA setting, which has one concrete consequence worth knowing up front: **a mailer (`WithMailer`/`WithEmail`) is mandatory for `/auth/admin/login` to work at all** while this stays on, since the second-factor code has to be emailed. Turn it off with `SecurityConfig.DisableAdminTwoFactor` (via `WithSecurity`) for an API-only deployment with no email delivery at all — a real reduction in admin-account security, so only do this alongside a deliberate decision that no mailer will ever be configured. `NewConfig`'s validation reflects the current state directly — its error names exactly which enabled feature (`RequireEmailVerification`, `EnableInvite`, `RequireEmail2FA`, `DefaultTwoFactorEnabled`, or this one) is still requiring a mailer; `EnvironmentDev` defaults to a log-only mailer automatically if none is configured but one is still needed. See [Configuration → WithMailer / WithEmail / WithTemplates](../configuration.mdx#withmailer--withemail--withtemplates--required-unless-every-email-feature-is-off), [Two-factor authentication](authentication.mdx#two-factor-authentication) for the verify step, and [Security](../security.mdx#two-factor-authentication) for the reasoning.
 </Callout>
 
 **Response** (`200 OK`) — never a session directly. A correct admin password returns a gated challenge, the same shape [Login](authentication.mdx#login) uses:
@@ -128,14 +128,19 @@ result, err := auth.Services.Auth.AdminLogin(ctx, service.LoginInput{
     UserAgent: r.UserAgent(),
 })
 if err != nil {
-    // *domain.AuthError — invalid_credentials covers "not an admin" too
+    // wraps a *domain.AuthError — invalid_credentials covers "not an admin" too
 }
 // result.RequiresTwoFactor is always true here — result.TwoFactorChallenge is
 // the challenge id, result.BindingToken() is what the handler sets as a cookie.
 
-user, session, rawToken, refreshToken, err := auth.Services.TwoFactor.Verify(
+verified, err := auth.Services.TwoFactor.Verify(
     ctx, result.TwoFactorChallenge, result.BindingToken(), code, r.RemoteAddr, r.UserAgent(),
 )
+if err != nil {
+    // wraps a *domain.AuthError — see Error Handling → Handling errors programmatically
+}
+// verified.User is the admin; verified.SessionToken / verified.RefreshToken
+// are the raw values — set them as cookies yourself
 ```
 
 ---
@@ -259,7 +264,10 @@ curl https://api.myapp.com/admin/users/b3f1... \
 #### Programmatic (Go)
 
 ```go
-detail, err := auth.Services.Admin.GetUserDetail(ctx, userID)
+detail, err := auth.Services.Admin.GetUserDetail(ctx, service.GetUserDetailInput{
+    UserID:  userID,
+    ActorID: adminID, // the admin making this call
+})
 // detail.User, detail.ActiveSessionCount, detail.Providers
 ```
 
@@ -371,7 +379,11 @@ curl -X PATCH https://api.myapp.com/admin/users/b3f1.../role \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Admin.UpdateUserRole(ctx, userID, "admin")
+err := auth.Services.Admin.UpdateUserRole(ctx, service.UpdateUserRoleInput{
+    UserID:  userID,
+    Role:    "admin",
+    ActorID: adminID, // the admin making this call
+})
 ```
 
 ---
@@ -412,8 +424,8 @@ curl -X PATCH https://api.myapp.com/admin/users/b3f1.../ban \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Admin.BanUser(ctx, userID)
-err  = auth.Services.Admin.UnbanUser(ctx, userID)
+err := auth.Services.Admin.BanUser(ctx, service.BanUserInput{UserID: userID, ActorID: adminID})
+err  = auth.Services.Admin.UnbanUser(ctx, service.UnbanUserInput{UserID: userID, ActorID: adminID})
 ```
 
 ---
@@ -452,7 +464,7 @@ curl -X DELETE https://api.myapp.com/admin/users/b3f1... \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Admin.DeleteUser(ctx, userID)
+err := auth.Services.Admin.DeleteUser(ctx, service.DeleteUserInput{UserID: userID, ActorID: adminID})
 ```
 
 ---
@@ -489,8 +501,9 @@ curl "https://api.myapp.com/admin/users/b3f1.../sessions?limit=20" \
 
 ```go
 sessions, total, err := auth.Services.Admin.ListUserSessions(ctx, service.AdminListUserSessionsInput{
-    UserID: userID,
-    Limit:  20,
+    ActorID: adminID, // the admin making this call
+    UserID:  userID,
+    Limit:   20,
 })
 ```
 
@@ -530,8 +543,12 @@ curl -X DELETE https://api.myapp.com/admin/users/b3f1.../sessions \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Admin.RevokeUserSession(ctx, userID, sessionID)
-err  = auth.Services.Admin.RevokeUserSessions(ctx, userID) // all of them
+err := auth.Services.Admin.RevokeUserSession(ctx, service.RevokeUserSessionInput{
+    UserID: userID, SessionID: sessionID, ActorID: adminID,
+})
+err  = auth.Services.Admin.RevokeUserSessions(ctx, service.RevokeUserSessionsInput{
+    UserID: userID, ActorID: adminID,
+}) // all of them
 ```
 
 ---
@@ -648,7 +665,7 @@ const { invites, total } = await apiRequest(API_BASE, "GET", "/admin/invites?sta
 
 ### Revoke an invite — `DELETE /admin/invites/{id}`
 
-Soft-cancels it — sets `status: "revoked"`. The row still exists, so it still shows up in [List invites](#list-invites--get-admininvites); an attempt to redeem it fails with `invite_revoked` instead of `invite_not_found`.
+Soft-cancels it — sets `status: "revoked"`. The row still exists, so it still shows up in [List invites](#list-invites--get-admininvites); an attempt to redeem it fails with `invite_already_used` instead of `invite_not_found`.
 
 **Response**: `{ "message": "Invite revoked" }`
 

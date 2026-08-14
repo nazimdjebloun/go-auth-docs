@@ -95,8 +95,8 @@ goauth.WithSecurity(goauth.SecurityConfig{
         RequireDigit:     true,
         RequireSpecial:   false,
     },
-    TokenTTL:      time.Hour,          // optional, default 1h
-    AllowHTTPURLs: goauth.Bool(false), // optional, default derived from Environment
+    TokenTTL:      time.Hour,                            // optional, default 1h
+    AllowHTTPURLs: goauth.RequireHTTPSEmailLinks(),       // optional, default derived from Environment
 
     RequireEmail2FA:                  false, // optional, default false — mandatory email 2FA on every password login
     DefaultTwoFactorEnabled:          false, // optional, default false — seeds User.TwoFactorEnabled at registration
@@ -114,7 +114,7 @@ goauth.WithSecurity(goauth.SecurityConfig{
 | `CSRFToken` | `*middleware.CSRFTokenConfig` | Optional | auto-created | **Overrides only.** Leaving it `nil` does not disable anything — see below. |
 | `PasswordPolicy` | `domain.PasswordPolicy` | Optional | `MinLength: 8, RequireDigit: true` | Setting any one field means you're specifying the whole policy — see note below. |
 | `TokenTTL` | `time.Duration` | Optional | `1h` | Lifetime of email verification and password reset tokens. |
-| `AllowHTTPURLs` | `*bool` | Optional | derived — `true` in `EnvironmentDev`, `false` otherwise | Governs `http://` links in rendered email templates only, not transport. |
+| `AllowHTTPURLs` | `*bool` | Optional | derived — `true` in `EnvironmentDev`, `false` otherwise | Governs `http://` links in rendered email templates only, not transport. Override with `goauth.AllowPlaintextEmailLinks()` or `goauth.RequireHTTPSEmailLinks()`. |
 | `RequireEmail2FA` | `bool` | Optional | `false` | Makes email 2FA mandatory for every password login (`Login`, `AdminLogin`, `Register`, invite registration). While on, `Enable`/`Disable` both reject — users cannot opt out. OAuth logins are not covered; see [Security](security.mdx). |
 | `DefaultTwoFactorEnabled` | `bool` | Optional | `false` | Seeds `User.TwoFactorEnabled` at registration (email/password only). Users can still call `Disable` to opt out — use `RequireEmail2FA` if that shouldn't be possible. |
 | `TwoFactorCodeTTL` | `time.Duration` | Optional | `5m` | Lifetime of a 2FA login code. Deliberately shorter than `VerificationCodeTTL`: a 6-digit code has ~20 fewer bits of entropy than the 8-char alphanumeric codes used elsewhere. |
@@ -122,6 +122,8 @@ goauth.WithSecurity(goauth.SecurityConfig{
 | `TwoFactorChallengeCookieName` | `string` | Optional | `_2fa_challenge` | Overrides the binding cookie name. |
 
 `PasswordPolicy` fields (`MinLength int`, `RequireUppercase bool`, `RequireDigit bool`, `RequireSpecial bool`) are all individually optional, but the struct as a whole replaces the default — if you set `RequireUppercase: true` without repeating `MinLength` or `RequireDigit`, those two are no longer applied.
+
+`Validate` also rejects any password over **72 bytes**, regardless of `MinLength` — that's bcrypt's real input limit (measured in bytes, not characters, so a multi-byte passphrase hits it sooner than an all-ASCII one of the same length), and the check runs before hashing so a too-long password gets a clear `400 weak_password` instead of a generic `500`. Don't set `MinLength` above 72.
 
 The double-submit token layer is **on in every deployment**. `WithSecret` is
 mandatory at 32+ bytes, and `New` creates a `CSRFTokenConfig` with the defaults
@@ -168,12 +170,12 @@ Session and refresh-token lifetimes.
 
 ```go
 goauth.WithSession(goauth.SessionConfig{
-    TTL:             30 * 24 * time.Hour, // optional, default 30d
-    IdleTTL:         7 * 24 * time.Hour,  // optional, default 7d
-    RefreshTokenTTL: 30 * 24 * time.Hour, // optional, default 30d
-    MaxLifetime:     0,                   // optional, default 0 (no limit)
-    GraceWindow:     10 * time.Second,    // optional, default 5s — or goauth.Disabled
-    TouchDebounce:   goauth.Disabled,     // optional, default 5m — or goauth.Disabled
+    TTL:             30 * 24 * time.Hour,        // optional, default 30d
+    IdleTTL:         7 * 24 * time.Hour,         // optional, default 7d
+    RefreshTokenTTL: 30 * 24 * time.Hour,        // optional, default 30d
+    MaxLifetime:     0,                          // optional, default 0 (no limit)
+    GraceWindow:     goauth.Duration(10 * time.Second), // optional, default 5s
+    TouchDebounce:   goauth.Duration(0),          // optional, default 5m — 0 turns it off
 })
 ```
 
@@ -183,10 +185,10 @@ goauth.WithSession(goauth.SessionConfig{
 | `IdleTTL` | `time.Duration` | Optional | `7d` | Timeout since last activity. Must not exceed `TTL`. |
 | `RefreshTokenTTL` | `time.Duration` | Optional | `30d` | Must not be less than `TTL`. |
 | `MaxLifetime` | `time.Duration` | Optional | `0` — no limit | If set, must be `>= TTL`. |
-| `GraceWindow` | `time.Duration` | Optional | `5s` | Window a just-rotated refresh token is still accepted, so two requests racing to refresh don't log the user out. Use `goauth.Disabled` to turn it off — a plain `0` means "use the default," not "off." |
-| `TouchDebounce` | `time.Duration` | Optional | `5m` | Minimum interval between `last_active_at` writes. `goauth.Disabled` writes on every authenticated request. |
+| `GraceWindow` | `*time.Duration` | Optional | `5s` | Window a just-rotated refresh token is still accepted, so two requests racing to refresh don't log the user out. `nil` (the zero value — leave the field out) means "use the default"; a non-nil pointer is used exactly as given, including `goauth.Duration(0)` to turn it off. Set it with `goauth.Duration(...)`, since Go can't take the address of a duration literal directly. |
+| `TouchDebounce` | `*time.Duration` | Optional | `5m` | Minimum interval between `last_active_at` writes. Same `nil`-vs-pointer rule as `GraceWindow`; `goauth.Duration(0)` writes on every authenticated request. |
 
-Only the exact `goauth.Disabled` sentinel means off; any other negative duration is treated as a mistake, not a deliberate opt-out.
+`GraceWindow` and `TouchDebounce` are pointers specifically so "left unset" and "explicitly zero" can't collide — with a plain `time.Duration` field, `GraceWindow: 0` and simply not mentioning `GraceWindow` at all are the same struct, so one of the two meanings would always win by accident. A `*time.Duration` field can be `nil` (unset → default) or point at `0` (off) as two different values.
 
 **Expected errors**
 
@@ -195,8 +197,8 @@ Only the exact `goauth.Disabled` sentinel means off; any other negative duration
 - `session_idle_ttl must not exceed session_ttl`
 - `refresh_token_ttl must be positive`
 - `refresh_token_ttl must not be less than session_ttl`
-- `session grace_window must not be negative (use goauth.Disabled to turn it off)` — hint: you passed a negative duration that isn't the `Disabled` sentinel.
-- `session touch_debounce must not be negative (use goauth.Disabled to turn it off)` — same hint.
+- `session grace_window must not be negative (use goauth.Duration(0) to turn it off)` — hint: you passed a negative duration.
+- `session touch_debounce must not be negative (use goauth.Duration(0) to turn it off)` — same hint.
 - `session max_lifetime must not be negative (0 = no limit)`
 - `session max_lifetime must not be less than session_ttl` — hint: only checked when `MaxLifetime` is set above zero.
 
@@ -254,7 +256,7 @@ A `bool` has no "unset" state — an omitted `false` looks identical to a delibe
 
 **Expected errors**
 
-- `email: Mailer or Email config required — AdminLogin always requires two-factor email delivery, and RequireEmailVerification/EnableInvite/RequireEmail2FA/DefaultTwoFactorEnabled each also need it when enabled` — hint: call `WithMailer` or `WithEmail`; see [`WithMailer` / `WithEmail` / `WithTemplates`](#withmailer--withemail--withtemplates--required) below for the `EnvironmentDev` exception.
+- `email: Mailer or Email config required — enabled features need it: <reasons>` — the `<reasons>` list names exactly which of `EnableInvite`, `RequireEmailVerification`, `RequireEmail2FA`, `DefaultTwoFactorEnabled`, or AdminLogin two-factor is still requiring one; hint: call `WithMailer`/`WithEmail`, or turn off every reason listed (`SecurityConfig.DisableAdminTwoFactor` for the last one) — see [`WithMailer` / `WithEmail` / `WithTemplates`](#withmailer--withemail--withtemplates--required-unless-every-email-feature-is-off) below for the `EnvironmentDev` exception.
 - `registration: invite_ttl must be positive` — hint: only reachable via an explicit negative value; an omitted one defaults to `7d`.
 - `registration: verification_code_ttl must be positive` — same hint, defaults to `15m`.
 - `registration: RequireEmailVerification has no effect when both EnableEmailPassword and EnableOAuth are disabled`.
@@ -283,9 +285,9 @@ goauth.WithOrganizations(goauth.OrganizationConfig{
 - `organizations.max_orgs_per_user must be between 0 and 100 (0 = default 100)`.
 - `organizations.invite_ttl must be positive` — hint: only reachable via an explicit negative value.
 
-## `WithMailer` / `WithEmail` / `WithTemplates` — required
+## `WithMailer` / `WithEmail` / `WithTemplates` — required unless every email feature is off
 
-A mailer is **always required** by validation, in every environment — not just when `EnableInvite`, `RequireEmailVerification`, `RequireEmail2FA`, or `DefaultTwoFactorEnabled` is on. This is because `POST /auth/admin/login` requires two-factor email delivery unconditionally, independent of all four of those flags (see [Admin login](guides/admin.mdx#admin-login) and [Security](security.mdx#two-factor-authentication)) — so every deployment needs a working mailer whether or not it opts into any of the optional email-gated features.
+A mailer is required whenever some configured feature actually sends email: `EnableInvite`, `RequireEmailVerification`, `RequireEmail2FA`, `DefaultTwoFactorEnabled`, or `POST /auth/admin/login`'s two-factor challenge (on by default — see [Admin login](guides/admin.mdx#admin-login) and [Security](security.mdx#two-factor-authentication)). Set `SecurityConfig.DisableAdminTwoFactor` to drop the last one; with all five off, an API-only deployment needs no mailer at all. `NewConfig`'s validation error names exactly which enabled feature is still requiring one.
 
 **Exception: `EnvironmentDev`.** If neither `WithMailer` nor `WithEmail` is set and `Environment` is `EnvironmentDev`, `NewConfig` automatically defaults to a log-only mailer (`goauth.LogMailer`) instead of erroring — emails are logged (`slog`) rather than delivered, so local development works with zero mailer setup. This default only fills in when *nothing* was configured; an explicit `WithMailer`/`WithEmail` call is never overridden. Outside `EnvironmentDev`, no default is applied — a still-unconfigured mailer is a validation error.
 
@@ -297,7 +299,7 @@ goauth.WithEmail(goauth.EmailConfig{
     From:    "auth@myapp.com",       // required, must be a valid email address
     User:    os.Getenv("SMTP_USER"), // optional — must be set together with Pass, or both empty
     Pass:    os.Getenv("SMTP_PASS"), // optional — same pairing rule as User
-    TLSMode: goauth.TLSStart,        // optional, default TLSNone (plaintext) — TLSNone | TLSStart | TLSImplicit
+    TLSMode: goauth.TLSStart,        // optional, default TLSStart (STARTTLS) — TLSStart | TLSImplicit | TLSNone
 })
 
 // Or your own implementation of port.Mailer (Resend, Postmark, SES, ...):
@@ -314,9 +316,10 @@ goauth.WithTemplates(myTemplateProvider)
 
 | Option | Purpose | Required | Notes |
 |---|---|---|---|
-| `WithMailer(port.Mailer)` | Your own delivery implementation | Required (auto-defaulted to `LogMailer` in `EnvironmentDev` — see above) | Takes precedence over `WithEmail` if both are set. |
-| `WithEmail(EmailConfig)` | Built-in SMTP delivery | Required (auto-defaulted to `LogMailer` in `EnvironmentDev` — see above) | Ignored if `WithMailer` is also set — its fields aren't even validated in that case. |
+| `WithMailer(port.Mailer)` | Your own delivery implementation | Required unless every email-sending feature is off (auto-defaulted to `LogMailer` in `EnvironmentDev` — see above) | Takes precedence over `WithEmail` if both are set. |
+| `WithEmail(EmailConfig)` | Built-in SMTP delivery | Required unless every email-sending feature is off (auto-defaulted to `LogMailer` in `EnvironmentDev` — see above) | Ignored if `WithMailer` is also set — its fields aren't even validated in that case. |
 | `WithTemplates(port.TemplateProvider)` | Replace the built-in email templates | Optional | The library still renders subject/HTML/text and hands finished strings to the mailer either way — this replaces content, `WithMailer` replaces delivery. |
+| `SecurityConfig.DisableAdminTwoFactor` | Turn off `POST /auth/admin/login`'s unconditional two-factor challenge | Optional, default off (challenge stays on) | Set via `WithSecurity`. The last of the five mailer-requiring features to disable for a mailer-free, API-only deployment. |
 
 **`EmailConfig`** (only validated when `WithEmail` is set and `WithMailer` is not)
 
@@ -327,11 +330,11 @@ goauth.WithTemplates(myTemplateProvider)
 | `Port` | `int` | Required | — | 1–65535. |
 | `User` | `string` | Optional | — | Must be set together with `Pass`, or both left empty. |
 | `Pass` | `string` | Optional | — | Same pairing rule as `User`. |
-| `TLSMode` | `TLSMode` | Optional | `TLSNone` | One of `TLSNone` (plaintext), `TLSStart` (STARTTLS, typically port 587), `TLSImplicit` (typically port 465). The zero value is plaintext — set this explicitly for anything but local testing. |
+| `TLSMode` | `TLSMode` | Optional | `TLSStart` | One of `TLSStart` (STARTTLS, typically port 587), `TLSImplicit` (typically port 465), `TLSNone` (plaintext). The zero value is `TLSStart` — plaintext requires setting `TLSNone` explicitly. |
 
 **Expected errors**
 
-- `email: Mailer or Email config required — AdminLogin always requires two-factor email delivery, and RequireEmailVerification/EnableInvite/RequireEmail2FA/DefaultTwoFactorEnabled each also need it when enabled` — reachable in any environment except `EnvironmentDev`, where the log-mailer default fills this in automatically.
+- `email: Mailer or Email config required — enabled features need it: <reasons>` — reachable in any environment except `EnvironmentDev`, where the log-mailer default fills this in automatically; empty only when no configured feature actually sends email, in which case there's no error at all.
 - `email: host is required`
 - `email: port must be between 1 and 65535, got N`
 - `email: from address is required`
@@ -396,7 +399,38 @@ func (myTemplates) Render(data port.TemplateData) (port.TemplateResult, error) {
 goauth.WithTemplates(myTemplates{})
 ```
 
-Three of the six types (`PasswordResetData`, `InviteData`, `OrgInviteData`) carry a URL and additionally implement `ValidateURLs(*port.URLValidator) error`. The built-in template provider calls this before rendering to enforce `https://`-only links (subject to `SecurityConfig.AllowHTTPURLs`) — **but a custom `TemplateProvider` bypasses that validation entirely**, since it's only wired up for the built-in provider. If you supply your own, you're responsible for whatever URL safety you want inside `Render` itself.
+Four of the eight types (`PasswordResetData`, `InviteData`, `OrgInviteData`, `TwoFactorSuspiciousData`) carry a URL and additionally implement `ValidateURLs(*port.URLValidator) error`. The built-in template provider calls this before rendering to enforce `https://`-only links (subject to `SecurityConfig.AllowHTTPURLs`) — **but a custom `TemplateProvider` bypasses that validation entirely**, since it's only wired up for the built-in provider. If you supply your own, you're responsible for whatever URL safety you want inside `Render` itself.
+
+#### Overriding a single template
+
+`WithTemplates` is all-or-nothing at the type level — implement `Render` and you own every template type, including the ones you don't actually want to change. To customize just one (say, password reset) without reimplementing the other seven, wrap the built-in provider (`emailtemplate.New`, which is exported) and delegate anything you don't override to it:
+
+```go
+type myTemplates struct {
+    fallback *emailtemplate.Provider
+}
+
+func newMyTemplates(v *port.URLValidator) (*myTemplates, error) {
+    fallback, err := emailtemplate.New(v)
+    if err != nil {
+        return nil, err
+    }
+    return &myTemplates{fallback: fallback}, nil
+}
+
+func (t *myTemplates) Render(data port.TemplateData) (port.TemplateResult, error) {
+    if d, ok := data.(port.PasswordResetData); ok {
+        return port.TemplateResult{
+            Subject: "Reset your " + d.AppName + " password",
+            HTML:    "<a href=\"" + d.ResetURL + "\">Reset password</a>",
+            Text:    "Reset your password: " + d.ResetURL,
+        }, nil
+    }
+    return t.fallback.Render(data) // everything else uses the built-in template
+}
+```
+
+`emailtemplate.New` takes the same `*port.URLValidator` you'd otherwise build yourself — construct one with `&port.URLValidator{AllowHTTP: ...}` matching your `SecurityConfig.AllowHTTPURLs` policy, since the fallback provider still enforces `ValidateURLs` even though your own override doesn't.
 
 ## `WithRateLimit` and its narrower variants — Optional, on by default
 
@@ -410,7 +444,7 @@ goauth.WithRateLimit(ratelimit.Config{
     Routes: map[string]ratelimit.Rate{ // optional, default: a built-in table of sensitive routes
         "POST /auth/login": {Requests: 10, Window: time.Minute},
     },
-    Store:           ratelimit.NewMemoryStore(), // required if Enabled; optional otherwise
+    Store:           nil,                        // optional, default: a bounded in-memory store
     DisabledPaths:   nil,                        // optional, default none
     TrustedIPs:      []string{"10.0.0.0/8"},     // optional, default none — required if IPAddressHeader is set
     IPv6Subnet:      64,                         // optional, default 64
@@ -440,8 +474,8 @@ goauth.WithRateLimitRoute("POST /auth/login", ratelimit.Rate{
 |---|---|---|---|---|
 | `Enabled` | `bool` | Optional | `true` | Disabling it logs a warning at startup — it's flagged as insecure for production. |
 | `Default` | `ratelimit.Rate` | Optional | `60 requests / minute` | Fallback for any route not in `Routes`. |
-| `Routes` | `map[string]ratelimit.Rate` | Optional | a built-in table covering login, register, password reset, verification, invites, etc. | Keyed by `"METHOD /path"`. |
-| `Store` | `ratelimit.Store` | Required if `Enabled` | in-memory | Swap for a distributed store (Redis, etc.) across multiple instances. |
+| `Routes` | `map[string]ratelimit.Rate` | Optional | a built-in table covering login, register, password reset, verification, invites, etc. | Keyed by `"METHOD /path"`. A `Rate{Requests: 0}` entry disables limiting for that one route. |
+| `Store` | `ratelimit.Store` | Optional | a bounded in-memory store | Left `nil`, one is created for you and closed by `Auth.Close()`. Supply one to swap in a distributed store (Redis, etc.) across multiple instances — then it's yours to close. |
 | `DisabledPaths` | `[]string` | Optional | none | |
 | `TrustedIPs` | `[]string` | Optional | none | IPs/CIDRs. Required if `IPAddressHeader` is set. |
 | `IPv6Subnet` | `int` | Optional | `64` | Subnet prefix length used to bucket IPv6 clients. Must be 1–128. |
@@ -449,8 +483,7 @@ goauth.WithRateLimitRoute("POST /auth/login", ratelimit.Rate{
 
 **Expected errors** (only reachable when `Enabled: true`)
 
-- `rate_limit: store is nil but enabled is true - provide ratelimit.NewMemoryStore() or a distributed store`.
-- `rate_limit: route "..." requests must be positive, got N` / `... window must be positive, got ...` — from `Default` or any entry in `Routes`.
+- `rate_limit: route "..." requests must be positive, got N` / `... window must be positive, got ...` — from `Default` or any entry in `Routes`. A `Routes` entry may be exactly `0` (that's the per-route opt-out); `Default` may not.
 - `rate_limit: ipv6_subnet must be between 1 and 128, got N`.
 - `rate_limit: trusted_ips contains invalid IP/CIDR "..."`.
 - `rate_limit: ip_address_header is set but trusted_ips is empty - client-supplied header can be spoofed to bypass rate limiting` — hint: call `WithTrustedIPs` alongside `WithIPAddressHeader`.
@@ -497,7 +530,7 @@ No validation errors — any non-nil logger is accepted as-is.
 goauth.WithAudit(goauth.AuditConfig{
     Enabled:       true,                    // optional, default false
     FailureMode:   audit.AuditFailureOpen,   // optional, default fail-open — or audit.AuditFailureClosed
-    RetentionDays: 90,                       // optional, default 90 (0 = forever)
+    RetentionDays: 0,                       // optional, default 0 — keep forever (0 = forever)
     QueueSize:     1000,                     // optional, default 1000
     Workers:       3,                        // optional, default 3
     BatchSize:     50,                       // optional, default 50
@@ -511,7 +544,7 @@ goauth.WithAuditSink(myOtherSink) // optional — adds one more sink at a time
 |---|---|---|---|---|
 | `Enabled` | `bool` | Optional | `false` | |
 | `FailureMode` | `audit.AuditFailureMode` | Optional | fail-open | |
-| `RetentionDays` | `int` | Optional | `90` — `0` means forever | |
+| `RetentionDays` | `int` | Optional | `0` (keep forever) | |
 | `QueueSize` | `int` | Optional | `1000` | |
 | `Workers` | `int` | Optional | `3` | |
 | `BatchSize` | `int` | Optional | `50` | |
