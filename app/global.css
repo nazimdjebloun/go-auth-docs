@@ -11,24 +11,43 @@ html > body[data-scroll-locked] {
   --removed-body-scroll-bar-size: 0px !important;
 }
 
-header {
+/* Scoped to #nd-nav — the home layout's floating navbar — and nothing else.
+   A bare `header` selector also matched two elements Fumadocs renders inside
+   the docs layout: #nd-subnav (the mobile top bar) and the unnamed <header>
+   inside the TOC popover. The popover's own wrapper is locked to
+   h-(--fd-toc-popover-height) (40px), which is also what reserves its grid
+   row, so the 32px of padding this rule added overflowed that box — and
+   since the popover is sticky at z-10 over the content, the overflow sat on
+   top of the first line of every docs page on tablet and mobile. */
+#nd-nav {
   @apply pt-5 pb-3 px-6;
 }
 
-header > div,
-header > nav {
-  @apply bg-white/70 dark:bg-white/[0.05] backdrop-blur-sm py-0.5 px-1 mx-auto border-0 rounded-2xl;
+#nd-nav > div,
+#nd-nav > nav {
+  @apply bg-white/70 dark:bg-white/[0.05] backdrop-blur-sm py-0.5 px-1 mx-auto border border-gray-200 dark:border-white/6 rounded-2xl;
   max-width: 1200px;
 }
 
-header a,
-header button {
+#nd-nav a,
+#nd-nav button {
   @apply text-gray-600 dark:text-white/60;
 }
 
-header a:hover,
-header button:hover {
+#nd-nav a:hover,
+#nd-nav button:hover {
   @apply text-gray-900 dark:text-white;
+}
+
+/* At tablet width the primary nav links move out of the mobile dropdown
+   and render inline in the header bar instead, leaving the GitHub/theme
+   row as the dropdown's only remaining child. Fumadocs sizes that row to
+   its own content there, so the role="separator" spacer inside it (which
+   pushes icons left / theme right, same as on mobile) has no free space
+   to expand into and everything clumps to one side. Forcing the row to
+   fill the full width restores the mobile-style separation. */
+#nd-nav [class*="sm:flex-row"] > div {
+  width: 100%;
 }
 
 /* The docs grid reserves two flexible 1fr columns on the outer edges that

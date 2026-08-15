@@ -87,13 +87,14 @@ export default function HomePage() {
           </span>
 
           <h1 className="text-4xl sm:text-6xl lg:text-7xl font-bold tracking-tight max-w-4xl text-balance leading-[1.1] text-gray-900 dark:text-white">
-            Self-hosted auth,
-            <br />
-            done right.
+            Self hosted auth for{' '}
+            {/* Go's own brand blue, in two shades so it clears WCAG large-text
+                contrast on both the light and dark backgrounds. */}
+            <span className="text-[#007D9C] dark:text-[#00ADD8]">GO</span>
           </h1>
 
           <p className="mt-7 text-base sm:text-lg max-w-2xl text-balance leading-relaxed text-gray-700 dark:text-white/50">
-            A self-hosted authentication and session library for Go <br /> email/password, OAuth, organizations, with CSRF protection and rate limiting.<br />
+            A complete self-hosted authentication library for Go <br /> email/password, OAuth, organizations, with CSRF protection and rate limiting.<br />
             Configure it with plain Go, mount the
             routes, and you have a real auth system in an afternoon.
           </p>
@@ -174,9 +175,13 @@ if err != nil {
     TTL:             30 * 24 * time.Hour,
     IdleTTL:         7 * 24 * time.Hour,
     RefreshTokenTTL: 30 * 24 * time.Hour,
-    MaxLifetime:     0,                // 0 = no absolute cap
-    GraceWindow:     5 * time.Second,  // goauth.Disabled turns it off
-    TouchDebounce:   5 * time.Minute,
+    MaxLifetime:     0, // 0 = no absolute cap
+
+    // Both are *time.Duration, so "left unset" and "explicitly off" can't
+    // collide: nil uses the default (5s / 5m), goauth.Duration(0) turns
+    // the feature off.
+    GraceWindow:   goauth.Duration(5 * time.Second),
+    TouchDebounce: goauth.Duration(5 * time.Minute),
 }),
 goauth.WithCookie(goauth.CookieConfig{
     Name:        "goauth_session",
@@ -238,7 +243,9 @@ goauth.WithApp(goauth.AppConfig{
     },
 }),
 
-// Per-IP token bucket rate limiter
+// Fixed-window rate limiter, keyed on the matched route pattern plus
+// the client IP. The in-memory store is built for you and is bounded —
+// pass WithRateLimitStore for a shared one (Redis) across instances.
 goauth.WithRateLimit(ratelimit.Config{
     Enabled: true,
     Default: ratelimit.Rate{
@@ -279,14 +286,14 @@ goauth.WithMailer(myMailer),`} />
                 className="rounded-2xl p-7 bg-white/60 dark:bg-white/3 border border-gray-200 dark:border-white/6 backdrop-blur-md transition-all duration-300 hover:bg-white/80 dark:hover:bg-white/5"
               >
                 <div className="text-2xl mb-4 text-gray-400 dark:text-white/60" aria-hidden>{f.icon}</div>
-                <h3 className="text-base font-semibold text-gray-900 dark:text-white">{f.title}</h3>
+                <h3 className="text-base font-semibold text-[#005A73] dark:text-[#00ADD8]">{f.title}</h3>
                 <p className="mt-2 text-sm leading-relaxed text-gray-500 dark:text-white/45">{f.description}</p>
               </div>
             ))}
           </div>
         </section>
 
-        {/* Footer */}
+        {/* Footer (old) — kept for reference, replaced by variant B below.
         <footer className="px-6 pb-8">
           <div className="rounded-3xl p-8 sm:p-10 bg-white/60 dark:bg-white/3 border border-gray-200 dark:border-white/6 backdrop-blur-xl w-full">
             <div className="flex flex-col sm:flex-row items-start justify-between gap-8 mb-8">
@@ -315,6 +322,60 @@ goauth.WithMailer(myMailer),`} />
             </div>
 
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs text-gray-400 dark:text-white/30">
+              <span>© 2026 go-auth. All rights reserved.</span>
+              <div className="flex gap-5">
+                <span>MIT License</span>
+                <a href="https://github.com/nazimdjebloun/go-auth" target="_blank" rel="noopener noreferrer" className="hover:text-gray-600 dark:hover:text-white/60 transition-colors">Source Code</a>
+              </div>
+            </div>
+          </div>
+        </footer>
+        */}
+
+        {/* Footer variant B — for side-by-side comparison against the one above.
+            Not wired up anywhere else; delete whichever loses. */}
+        <footer className="px-6 pb-8">
+          <div className="border-t border-gray-200 dark:border-white/6 pt-10">
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-10 mb-10 text-center sm:text-left">
+              <div className="sm:col-span-2">
+                <span className="text-xl font-bold tracking-tight text-gray-900 dark:text-white">
+                  go-auth
+                </span>
+                <p className="mt-2 text-sm font-medium text-gray-700 dark:text-white/50">
+                  Self hosted auth for <span className="text-[#005A73] dark:text-[#00ADD8]">Go</span>
+                </p>
+                <p className="mt-3 max-w-sm mx-auto sm:mx-0 text-sm leading-relaxed text-gray-700 dark:text-white/40">
+                  A complete self-hosted authentication library for Go <br /> email/password, OAuth, organizations, with CSRF protection and rate limiting.<br />
+                  Configure it with plain Go, mount the routes, and you have a real auth system in an afternoon.
+                </p>
+              </div>
+
+              <div>
+                <h4 className="text-sm font-medium text-gray-700 dark:text-white/50 mb-3">Docs</h4>
+                <nav className="flex flex-col items-center sm:items-start gap-2.5 text-sm text-gray-700 dark:text-white/50">
+                  <Link href="/docs" className="hover:text-gray-900 dark:hover:text-white transition-colors">Introduction</Link>
+                  <Link href="/docs/installation" className="hover:text-gray-900 dark:hover:text-white transition-colors">Installation</Link>
+                  <Link href="/docs/configuration" className="hover:text-gray-900 dark:hover:text-white transition-colors">Configuration</Link>
+                  <Link href="/docs/guides/authentication" className="hover:text-gray-900 dark:hover:text-white transition-colors">Guides</Link>
+                  <Link href="/docs/providers" className="hover:text-gray-900 dark:hover:text-white transition-colors">Providers</Link>
+                  <Link href="/docs/routes" className="hover:text-gray-900 dark:hover:text-white transition-colors">Routes</Link>
+                  <Link href="/docs/error-handling" className="hover:text-gray-900 dark:hover:text-white transition-colors">Error Handling</Link>
+                  <Link href="/docs/architecture" className="hover:text-gray-900 dark:hover:text-white transition-colors">Architecture</Link>
+                  <Link href="/docs/security" className="hover:text-gray-900 dark:hover:text-white transition-colors">Security</Link>
+                </nav>
+              </div>
+
+              <div>
+                <h4 className="text-sm font-medium text-gray-700 dark:text-white/50 mb-3">Resources</h4>
+                <nav className="flex flex-col items-center sm:items-start gap-2.5 text-sm text-gray-700 dark:text-white/50">
+                  <a href="https://github.com/nazimdjebloun/go-auth" target="_blank" rel="noopener noreferrer" className="hover:text-gray-900 dark:hover:text-white transition-colors">GitHub</a>
+                  <a href="https://pkg.go.dev/github.com/nazimdjebloun/go-auth" target="_blank" rel="noopener noreferrer" className="hover:text-gray-900 dark:hover:text-white transition-colors">Go Doc</a>
+                  <a href="https://github.com/nazimdjebloun/go-auth/issues" target="_blank" rel="noopener noreferrer" className="hover:text-gray-900 dark:hover:text-white transition-colors">Report an Issue</a>
+                </nav>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row items-center sm:items-center justify-center sm:justify-between gap-3 border-t border-gray-200 dark:border-white/6 pt-6 text-xs text-gray-600 dark:text-white/30 text-center sm:text-left">
               <span>© 2026 go-auth. All rights reserved.</span>
               <div className="flex gap-5">
                 <span>MIT License</span>
