@@ -7,6 +7,12 @@ export function baseOptions(): BaseLayoutProps {
       title: appName,
       transparentMode: 'always',
     },
+    links: [
+      {
+        text: 'Blog',
+        url: '/blog',
+      },
+    ],
     githubUrl: `https://github.com/${gitConfig.user}/${gitConfig.repo}`,
     themeSwitch: {
       enabled: true,
