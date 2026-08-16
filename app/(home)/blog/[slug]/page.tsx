@@ -23,13 +23,13 @@ export default async function BlogPostPage(props: PageProps<'/blog/[slug]'>) {
       />
       <div className="fixed inset-0 z-0 pointer-events-none bg-linear-to-b from-white/50 via-white/70 to-white/95 dark:from-black/40 dark:via-black/70 dark:to-black/95" />
 
-      <main className="relative z-10 flex-1 max-w-3xl mx-auto px-6 pt-32 pb-24 sm:pt-44">
-        <div className="rounded-2xl p-8 sm:p-10 bg-white/60 dark:bg-white/3 border border-gray-200 dark:border-white/6 backdrop-blur-md">
-          <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-gray-900 dark:text-white">
+      <main className="relative z-10 flex flex-col flex-1 w-full min-w-0 max-w-4xl mx-auto px-6 pt-32 pb-24 sm:pt-44">
+        <div className="flex flex-col w-full min-w-0 rounded-2xl p-8 sm:p-10 bg-white/60 dark:bg-white/3 border border-gray-200 dark:border-white/6 backdrop-blur-md">
+          <h1 className="text-2xl sm:text-4xl font-bold tracking-tight text-gray-900 dark:text-white">
             {post.title}
           </h1>
           <p className="text-sm text-gray-500 dark:text-white/40 mt-3 mb-10">{post.date}</p>
-          <DocsBody>
+          <DocsBody className="w-full min-w-0">
             <Body components={getMDXComponents()} />
           </DocsBody>
         </div>

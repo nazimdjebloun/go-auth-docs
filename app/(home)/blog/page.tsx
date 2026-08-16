@@ -22,7 +22,7 @@ export default function BlogIndexPage() {
       />
       <div className="fixed inset-0 z-0 pointer-events-none bg-linear-to-b from-white/50 via-white/70 to-white/95 dark:from-black/40 dark:via-black/70 dark:to-black/95" />
 
-      <main className="relative z-10 flex-1 max-w-3xl mx-auto px-6 pt-32 pb-24 sm:pt-44">
+      <main className="relative z-10 flex-1 min-w-0 max-w-4xl mx-auto px-6 pt-32 pb-24 sm:pt-44">
         <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-gray-900 dark:text-white mb-12">
           Blog
         </h1>
