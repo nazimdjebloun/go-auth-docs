@@ -1,0 +1,78 @@
+---
+title: Why I built go-auth
+description: Why go-auth exists, how it works, and what you should know before trusting it.
+date: 2026-08-16
+---
+
+I was learning Go, and at some point I wanted to build a real project with it. That's where I got stuck on the auth part. There wasn't a library I actually wanted to build on, a simple auth library in Go. I was looking for something like [Better Auth](https://www.better-auth.com), which I'd used heavily and liked, and there was no real equivalent for Go. So instead of working around it (like most people do), I decided to build the auth library myself. A lot of the ideas in go-auth came from studying what Better Auth got right.
+
+go-auth is a library that handles the boring, easy-to-get-wrong parts of auth, running entirely in your own process, against your own database.
+
+## Getting it running
+
+```go
+cfg, err := goauth.NewConfig(
+    goauth.WithApp(goauth.AppConfig{
+        Name:    "MyApp",
+        BaseURL: "https://myapp.com",
+        Database: goauth.DatabaseConfig{
+            URL:    os.Getenv("DATABASE_URL"),
+            Driver: goauth.DriverPostgres,
+        },
+        Environment: goauth.EnvironmentProd,
+    }),
+    goauth.WithSecret(os.Getenv("AUTH_SECRET")),
+    goauth.WithSecurity(goauth.SecurityConfig{
+        AllowedOrigins: []string{"https://myapp.com"},
+    }),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+auth, err := goauth.New(cfg)
+if err != nil {
+    log.Fatal(err)
+}
+
+mux := http.NewServeMux()
+auth.Mount(mux)
+```
+
+That gives you email and password login with verification and reset flows, OAuth through GitHub and Google, sessions built on two tokens with refresh rotation, email-based two-factor authentication, CSRF protection and rate limiting, organizations that support multiple teams, and an admin API that can list, ban, change roles, and revoke sessions for any user, with a full audit trail behind it. It works against Postgres, MySQL, or SQLite.
+
+## How it's put together
+
+Everything sits behind plain interfaces: `port.Mailer`, `port.Hasher`, `port.OAuthProvider`. The core logic never imports `net/http` or `database/sql` directly.
+
+That isn't architecture for its own sake. It means the login flow is testable without a database, your mailer in tests is a struct that appends to a slice, and swapping SQLite for Postgres is a config change rather than a rewrite. The [Architecture](/docs/architecture) page walks through the actual layout.
+
+## What's under it
+
+No hand-rolled cryptography. bcrypt from `golang.org/x/crypto` for passwords, `crypto/rand` for tokens, `crypto/subtle` for constant-time comparison. The one secret you provide goes through HKDF-SHA256 to derive a separate key per purpose, so compromising one doesn't give up the rest.
+
+Heavily tested, plus integration tests against real Postgres, MySQL, and SQLite in CI, with the race detector on every run and govulncheck on the dependency tree.
+
+Out of scope: TLS, database security, where you keep your secrets, traffic floods. Same as any library.
+
+No third-party security audit.
+
+## What it doesn't do yet
+
+Sessions and rate limit state live in memory right now. That's fine on a single instance, and wrong the moment you run two, so if you're already behind a load balancer, this isn't ready for you yet. A store backed by Redis is the fix, and it's the next thing I'm building.
+
+It's also not at version 1.0 yet, so the API can still change.
+
+Also on the roadmap: logging in with a username as an alternative to email, API keys for traffic between services and from a CLI, and a dashboard built on top of the admin API. Nothing here is tied to a specific release. The [changelog](/docs/changelog) is what's actually shipped.
+
+If one of these is what's standing between you and using it, [open an issue](https://github.com/nazimdjebloun/go-auth/issues). On a project this size, that's genuinely how I decide what's next.
+
+## A note on scope
+
+go-auth is deliberately ambitious. The goal isn't a login endpoint it's covering what a real application actually needs from auth, so that adopting it doesn't mean hand-rolling the four things it left out. That's a large surface, and it's large because auth is large.
+
+Which is the argument for not doing it alone. Every Go project that rebuilds sessions and password reset from scratch is solving a problem that's already been solved badly a hundred times, in private, with no one reviewing it. Pooling that effort into one open source auth library that gets read by many people is strictly better than everyone maintaining their own half finished version.
+
+So: issues, bug reports, security findings, and PRs are all wanted. If you've built auth in Go before and think I got something wrong, that's the most useful thing you can send me.
+
+Feel free to fork it and take it wherever you want, and that's the point if I stop maintaining it, you aren't stranded. But for most needs you shouldn't have to. The interfaces are there so you can swap the mailer, the hasher, or an OAuth provider without touching the security-critical paths.
