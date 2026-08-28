@@ -175,6 +175,9 @@ setAdminUser(verified.user); // cookies are already set
 | `email` | string | — | Exact match |
 | `search` | string | — | Matches name or email |
 | `role` | string | — | `admin` or `user` only — any other value is silently ignored, not applied as a filter |
+| `twoFactorEnabled` | bool | — | `true` or `false` — anything else is ignored, not applied as a filter |
+| `neverLoggedIn` | bool | — | `true` only — `last_login_at IS NULL`. Registered but never logged in since. |
+| `lastLoginBefore` | RFC3339 timestamp | — | `last_login_at < X`, excluding users who've never logged in (that's `neverLoggedIn`'s job) — "logged in before, gone dormant since." Composable with `neverLoggedIn` for two different questions in one dashboard. |
 | `orderBy` | string | `created_at` | Or `updated_at` — anything else falls back to the default |
 | `orderDirection` | string | `desc` | Or `asc` — anything else falls back to the default |
 
@@ -562,6 +565,454 @@ await apiRequest(API_BASE, "DELETE", `/admin/users/${userId}/sessions`);
 
 ---
 
+## Sessions across every user — `GET /admin/sessions`
+
+The incident-response view: active sessions platform-wide, not scoped to one user. Same base condition as `ListUserSessions` (not revoked, not yet expired), plus optional filters.
+
+Query (all optional): `offset`, `limit` (default `20`, max `100`); `userId`, `ip`, `search` (substring-matches `ip`/user agent); `createdAfter`, `createdBefore`, `expiresAfter`, `expiresBefore`, `lastActiveAfter`, `lastActiveBefore` (RFC3339); `orderBy` (`created_at` default, `expires_at`, `last_active_at`); `orderDirection` (`desc` default, `asc`).
+
+**Response**: `{ "sessions": [...], "total": 5, "limit": 20, "offset": 0 }`
+
+#### curl
+
+```bash
+curl "https://api.myapp.com/admin/sessions?ip=203.0.113.9" \
+  -H "Origin: https://myapp.com" \
+  -b admin-cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+ip := "203.0.113.9"
+result, err := auth.Services.Admin.ListSessions(ctx, service.AdminListSessionsInput{
+    ActorID: adminID,
+    IP:      &ip,
+    Limit:   20,
+})
+```
+
+---
+
+#### Client
+
+```ts
+const { sessions, total } = await apiRequest(API_BASE, "GET", "/admin/sessions?ip=203.0.113.9");
+```
+
+---
+
+## Bulk user actions — `POST /admin/users/bulk/{ban,unban,delete,revoke-sessions}`
+
+Each endpoint applies the same single-user action (`BanUser`, `UnbanUser`, `DeleteUser`, `RevokeUserSessions`) to a list of user IDs. This is **not atomic** — go-auth has no batch primitive, so each ID is a separate sequential call under the hood. One user's failure (already banned, last admin, not found) doesn't stop or roll back the rest; read `succeeded`/`failed` rather than treating a `200` as "all succeeded."
+
+Body: `{ "userIds": ["id1", "id2", ...] }` — 1 to 100 IDs.
+
+**Response**: `{ "succeeded": ["id1"], "failed": [{ "userId": "id2", "code": "last_admin", "message": "Cannot ban the last admin" }] }`
+
+`code` is the same stable `AuthError` code a single-user call would return — safe to match on.
+
+#### curl
+
+```bash
+curl -X POST https://api.myapp.com/admin/users/bulk/ban \
+  -H "Origin: https://myapp.com" -H "Content-Type: application/json" \
+  -H "X-CSRF-Token: $CSRF_TOKEN" \
+  -b admin-cookies.txt \
+  -d '{"userIds": ["b3f1...", "9e2c..."]}'
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+result, err := auth.Services.Admin.BulkBanUsers(ctx, service.BulkUserActionInput{
+    UserIDs: []string{"b3f1...", "9e2c..."},
+    ActorID: adminID,
+})
+// result.Succeeded, result.Failed
+```
+
+The same shape applies to `BulkUnbanUsers`, `BulkDeleteUsers`, and `BulkRevokeUserSessions`.
+
+---
+
+#### Client
+
+```ts
+const result = await apiRequest(API_BASE, "POST", "/admin/users/bulk/ban", {
+  userIds: ["b3f1...", "9e2c..."],
+});
+```
+
+---
+
+## Stats and activity
+
+Three read-only endpoints for an admin dashboard — an overview snapshot, a registrations-over-time trend, and a GitHub-commit-style daily login-activity heatmap. All three read from data go-auth already tracks (`users.last_login_at`, `users.created_at`, and the audit log) — nothing new is stored just for this.
+
+<Callout type="warn" title="The login endpoints need WithAudit(Enabled: true)">
+  `GET /admin/stats/logins` reads from the audit log — with auditing disabled it has nothing to query and returns an empty series, not an error. `GET /admin/stats` and `GET /admin/stats/registrations` don't depend on auditing at all; they read `users` directly.
+</Callout>
+
+### Overview — `GET /admin/stats`
+
+No params.
+
+**Response** (`200 OK`)
+
+```json
+{
+  "totalUsers": 1204,
+  "verifiedUsers": 1150,
+  "bannedUsers": 3,
+  "twoFactorEnabledUsers": 812,
+  "neverLoggedInUsers": 47,
+  "activeSessions": 389
+}
+```
+
+Each field is its own `List`/`ListAll` call with `Limit: 1` under the hood — `List` always runs a `COUNT(*)` query regardless of `Limit`, so the count is exact and the row fetch itself stays trivial. `neverLoggedInUsers` is `last_login_at IS NULL` — the same filter as [List users → `neverLoggedIn`](#list-users--get-adminusers) above, just counted rather than listed.
+
+#### curl
+
+```bash
+curl https://api.myapp.com/admin/stats -H "Origin: https://myapp.com" -b admin-cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+stats, err := auth.Services.Admin.GetStats(ctx, adminID)
+```
+
+---
+
+#### Client
+
+```ts
+const stats = await apiRequest(API_BASE, "GET", "/admin/stats");
+```
+
+### Registration trend — `GET /admin/stats/registrations`
+
+**Query params**: `from`, `to` — both required, RFC3339. Capped at a 400-day span (`invalid_input` beyond that).
+
+**Response** (`200 OK`) — one bucket per day that had at least one registration; days with zero are simply absent, not zero-filled:
+
+```json
+{
+  "registrations": [
+    { "date": "2026-08-01T00:00:00Z", "count": 4 },
+    { "date": "2026-08-03T00:00:00Z", "count": 1 }
+  ]
+}
+```
+
+#### curl
+
+```bash
+curl "https://api.myapp.com/admin/stats/registrations?from=2026-07-01T00:00:00Z&to=2026-08-01T00:00:00Z" \
+  -H "Origin: https://myapp.com" -b admin-cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+counts, err := auth.Services.Admin.GetRegistrationTrend(ctx, service.StatsRangeInput{
+    ActorID: adminID, From: from, To: to,
+})
+```
+
+---
+
+#### Client
+
+```ts
+const { registrations } = await apiRequest(
+  API_BASE, "GET", `/admin/stats/registrations?from=${from}&to=${to}`
+);
+```
+
+### Login activity — `GET /admin/stats/logins`
+
+**Query params**: `from`, `to` — both required, RFC3339, same 400-day cap. `userId` — optional; omit for a global heatmap (every user's successful logins), set for one user's.
+
+Counts `login.success` audit events only — email/password logins. OAuth (`oauth.login`) and admin (`admin.login.success`) logins are separate event types and aren't folded in.
+
+**Response** (`200 OK`) — same shape as the registration trend, one bucket per day with at least one login:
+
+```json
+{ "logins": [ { "date": "2026-08-01T00:00:00Z", "count": 12 } ] }
+```
+
+#### curl
+
+```bash
+# Global
+curl "https://api.myapp.com/admin/stats/logins?from=2026-07-01T00:00:00Z&to=2026-08-01T00:00:00Z" \
+  -H "Origin: https://myapp.com" -b admin-cookies.txt
+
+# One user
+curl "https://api.myapp.com/admin/stats/logins?from=2026-07-01T00:00:00Z&to=2026-08-01T00:00:00Z&userId=b3f1..." \
+  -H "Origin: https://myapp.com" -b admin-cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+// Global
+counts, err := auth.Services.Admin.GetLoginActivity(ctx, service.LoginActivityInput{
+    ActorID: adminID, From: from, To: to,
+})
+// One user
+counts, err = auth.Services.Admin.GetLoginActivity(ctx, service.LoginActivityInput{
+    ActorID: adminID, UserID: &userID, From: from, To: to,
+})
+```
+
+---
+
+#### Client
+
+```ts
+const { logins } = await apiRequest(
+  API_BASE, "GET", `/admin/stats/logins?from=${from}&to=${to}&userId=${userId}`
+);
+```
+
+---
+
+## Organizations — requires `WithOrganizations`
+
+Platform-admin oversight of organizations: list any org, view one regardless of the caller's own membership in it, and force a mutation an org's own owner/admin couldn't otherwise trigger from outside it. These call `auth.Services.Org` (not `auth.Services.Admin`) — the methods live on `OrgService` because it's only constructed when organizations are enabled, so they simply don't exist (and the routes below aren't mounted) when they're not, the same way every other `/auth/orgs/*` route already works.
+
+<Callout type="info" title="Every mutation here publishes its own admin.org.* audit event">
+  Distinct from the `organization.*` events the org's own owner/admin would publish for the same action — see [Audit Logs](audit-logs.mdx) for the full list and why the distinction matters. `admin.org.deleted` also snapshots the org's `name`/`slug` into the event's metadata, since the `organizations` row is hard-deleted and nothing else could resolve `orgId` back to a name afterward.
+</Callout>
+
+### List organizations — `GET /admin/orgs`
+
+Query (all optional): `search` (matches name or slug), `createdAfter`, `createdBefore` (RFC3339), `orderBy` (`name` default, `created_at`, `member_count`), `orderDirection` (`asc` default, `desc`), `offset`, `limit` (omit for default `20`; `0` = unlimited; else capped at `100`).
+
+**Response**: `{ "orgs": [...], "total": 42, "limit": 20, "offset": 0 }`
+
+#### curl
+
+```bash
+curl "https://api.myapp.com/admin/orgs?search=acme" \
+  -H "Origin: https://myapp.com" -b admin-cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+search := "acme"
+result, err := auth.Services.Org.AdminListOrgs(ctx, service.AdminListOrgsInput{
+    ActorID: adminID,
+    Search:  &search,
+})
+```
+
+---
+
+#### Client
+
+```ts
+const { orgs, total } = await apiRequest(API_BASE, "GET", "/admin/orgs?search=acme");
+```
+
+---
+
+### Get an organization — `GET /admin/orgs/{orgID}`
+
+Returns the org regardless of the caller's own membership in it. Publishes `admin.org.viewed`.
+
+#### curl
+
+```bash
+curl https://api.myapp.com/admin/orgs/org-123 \
+  -H "Origin: https://myapp.com" -b admin-cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+org, err := auth.Services.Org.AdminGetOrg(ctx, service.AdminGetOrgInput{
+    OrgID: "org-123", ActorID: adminID,
+})
+```
+
+---
+
+#### Client
+
+```ts
+const org = await apiRequest(API_BASE, "GET", "/admin/orgs/org-123");
+```
+
+---
+
+### List an organization's members — `GET /admin/orgs/{orgID}/members`
+
+Same query params as the self-service `GET /auth/orgs/{orgID}/members` (see [Organizations](organizations.mdx)), but bypasses the membership check that endpoint applies — the caller doesn't need to be a member of `orgID`. Publishes `admin.org.viewed`.
+
+#### curl
+
+```bash
+curl https://api.myapp.com/admin/orgs/org-123/members \
+  -H "Origin: https://myapp.com" -b admin-cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+result, err := auth.Services.Org.AdminListOrgMembers(ctx, service.AdminListOrgMembersInput{
+    OrgID: "org-123", ActorID: adminID,
+})
+```
+
+---
+
+#### Client
+
+```ts
+const { members, total } = await apiRequest(API_BASE, "GET", "/admin/orgs/org-123/members");
+```
+
+---
+
+### Add a member — `POST /admin/orgs/{orgID}/members`
+
+Force-adds a user to an org regardless of the caller's own membership. This is the recovery path for an org whose only owner is gone (account deleted, offboarded, whatever the cause) and is otherwise unmanageable by anyone — `AdminRemoveMember`/`AdminUpdateMemberRole` alone can't fix that, since both require the target to already be a member. Publishes `admin.org.member.added`.
+
+**Request body**: `{ "userId": "...", "role": "owner" | "admin" | "member" }`
+
+#### curl
+
+```bash
+curl -X POST https://api.myapp.com/admin/orgs/org-123/members \
+  -H "Origin: https://myapp.com" -H "Content-Type: application/json" \
+  -H "X-CSRF-Token: $CSRF_TOKEN" \
+  -b admin-cookies.txt \
+  -d '{"userId": "b3f1...", "role": "owner"}'
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+err := auth.Services.Org.AdminAddMember(ctx, service.AdminAddMemberInput{
+    OrgID: "org-123", UserID: "b3f1...", Role: domain.OrgRoleOwner, ActorID: adminID,
+})
+```
+
+---
+
+#### Client
+
+```ts
+await apiRequest(API_BASE, "POST", "/admin/orgs/org-123/members", {
+  userId: "b3f1...",
+  role: "owner",
+});
+```
+
+---
+
+### Delete an organization — `DELETE /admin/orgs/{orgID}`
+
+Force-deletes the org regardless of the caller's own membership. Publishes `admin.org.deleted` with the org's `name`/`slug` in the event metadata.
+
+#### curl
+
+```bash
+curl -X DELETE https://api.myapp.com/admin/orgs/org-123 \
+  -H "Origin: https://myapp.com" -H "X-CSRF-Token: $CSRF_TOKEN" \
+  -b admin-cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+err := auth.Services.Org.AdminDeleteOrg(ctx, service.AdminOrgActionInput{
+    OrgID: "org-123", ActorID: adminID,
+})
+```
+
+---
+
+#### Client
+
+```ts
+await apiRequest(API_BASE, "DELETE", "/admin/orgs/org-123");
+```
+
+---
+
+### Remove a member / change a member's role — `DELETE /admin/orgs/{orgID}/members/{userID}`, `PATCH /admin/orgs/{orgID}/members/{userID}/role`
+
+Force-remove or force-change a role, regardless of the caller's own membership. Removal still refuses to remove an org's last owner — that's a repository-level invariant, not an authorization check, so it holds for an admin override too. The role change is the one place this deliberately behaves differently from the self-service version: granting or revoking Owner normally requires the acting user to already be an Owner of that org (so a same-org Admin can't self-promote); `AdminUpdateMemberRole` skips that guard, since a platform admin acting from outside the org isn't the same threat the guard exists for. Publishes `admin.org.member.removed` / `admin.org.member.role_changed`.
+
+**Role change request body**: `{ "role": "owner" | "admin" | "member" }`
+
+#### curl
+
+```bash
+curl -X DELETE https://api.myapp.com/admin/orgs/org-123/members/b3f1... \
+  -H "Origin: https://myapp.com" -H "X-CSRF-Token: $CSRF_TOKEN" \
+  -b admin-cookies.txt
+
+curl -X PATCH https://api.myapp.com/admin/orgs/org-123/members/b3f1.../role \
+  -H "Origin: https://myapp.com" -H "Content-Type: application/json" \
+  -H "X-CSRF-Token: $CSRF_TOKEN" \
+  -b admin-cookies.txt \
+  -d '{"role": "owner"}'
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+err := auth.Services.Org.AdminRemoveMember(ctx, service.AdminRemoveMemberInput{
+    OrgID: "org-123", UserID: "b3f1...", ActorID: adminID,
+})
+
+err = auth.Services.Org.AdminUpdateMemberRole(ctx, service.AdminUpdateMemberRoleInput{
+    OrgID: "org-123", UserID: "b3f1...", NewRole: domain.OrgRoleOwner, ActorID: adminID,
+})
+```
+
+---
+
+#### Client
+
+```ts
+await apiRequest(API_BASE, "DELETE", "/admin/orgs/org-123/members/b3f1...");
+await apiRequest(API_BASE, "PATCH", "/admin/orgs/org-123/members/b3f1.../role", { role: "owner" });
+```
+
+---
+
 ## Platform invites — requires `EnableInvite`
 
 Admin-issued, invite-only signup: an admin creates an invite for an email address, and the recipient completes registration with it via `POST /auth/invite/register` — covered in [Authentication → Register via invite](authentication.mdx#register-via-invite--requires-enableinvite-true). This is a different feature from organization invites — see [Organizations → Invites](organizations.mdx#invites) for those. These routes only exist when `RegistrationConfig.EnableInvite: true`; otherwise they 404.
@@ -630,7 +1081,7 @@ const invite = await apiRequest(API_BASE, "POST", "/admin/invites", { email: "ad
 
 ### List invites — `GET /admin/invites`
 
-**Query params**: `offset`, `limit` (default `20`, max `100`); `search`, `status` (optional).
+**Query params**: `offset`, `limit` (default `20`, max `100`); `search`, `status` (optional); `orderBy` (`created_at` default, `expires_at`, `email`, `status`), `orderDirection` (`desc` default, `asc`).
 
 **Response** (`200 OK`): `{ "invites": [...], "total": 42 }`
 
