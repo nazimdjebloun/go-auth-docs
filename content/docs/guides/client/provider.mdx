@@ -1,170 +1,81 @@
 ---
-title: "Provider & Context"
-description: "A React context built on authApi that turns the raw client into app-wide user/loading state, with an auto-signout when a session dies elsewhere."
-icon: "Component"
+title: "OAuth Provider Client"
+description: "OAuth login, registration, and account linking from the client."
+icon: "KeyRound"
 ---
 
-# Provider & Context
+# OAuth Provider Client
 
-`authApi` and `sessionsApi` are just functions — every component that needs to know who's logged in would otherwise call `authApi.me()` itself and manage its own loading state. This wraps that in a React context instead: one `<AuthProvider>` near the root of the app, one `useAuth()` hook everywhere else.
+This guide covers how to implement OAuth login, registration, and account linking from a frontend or mobile client.
 
-```tsx
-"use client";
+## OAuth login
 
-import {
-  createContext,
-  useContext,
-  useState,
-  useEffect,
-  useCallback,
-  type ReactNode,
-} from "react";
-import { authApi } from "./authApi";
-import { setUnauthorizedHandler } from "./client";
+Redirect the user to the provider's authorization URL:
 
-interface User {
-  id: string;
-  email: string;
-  name: string;
-  role: string;
-  isVerified: boolean;
-  hasPassword: boolean;
-}
-
-interface AuthContextValue {
-  user: User | null;
-  loading: boolean;
-  error: string | null;
-  refresh: () => Promise<void>;
-  login: (input: { email: string; password: string }) => Promise<{ requiresVerification?: boolean }>;
-  register: (input: { email: string; password: string; name: string }) => Promise<{ requiresVerification?: boolean }>;
-  logout: () => Promise<void>;
-}
-
-const AuthContext = createContext<AuthContextValue | null>(null);
-
-export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const refresh = useCallback(async () => {
-    try {
-      setUser(await authApi.me());
-      setError(null);
-    } catch {
-      setUser(null); // 401 here just means "not logged in", not a bug
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    setUnauthorizedHandler(() => setUser(null));
-    refresh();
-  }, [refresh]);
-
-  const login = useCallback(async (input: { email: string; password: string }) => {
-    setError(null);
-    try {
-      const result = await authApi.login(input);
-      if (result.requiresVerification) return { requiresVerification: true };
-      await refresh();
-      return {};
-    } catch (err: any) {
-      setError(err.message ?? err.error);
-      throw err;
-    }
-  }, [refresh]);
-
-  const register = useCallback(async (input: { email: string; password: string; name: string }) => {
-    setError(null);
-    try {
-      const result = await authApi.register(input);
-      if (result.requiresVerification) return { requiresVerification: true };
-      await refresh();
-      return {};
-    } catch (err: any) {
-      setError(err.message ?? err.error);
-      throw err;
-    }
-  }, [refresh]);
-
-  const logout = useCallback(async () => {
-    try {
-      await authApi.logout();
-    } catch {
-      // already logged out server-side, or the request itself failed — either way, proceed
-    }
-    setUser(null);
-    if (typeof window !== "undefined") window.location.href = "/login";
-  }, []);
-
-  return (
-    <AuthContext.Provider value={{ user, loading, error, refresh, login, register, logout }}>
-      {children}
-    </AuthContext.Provider>
-  );
-}
-
-export function useAuth(): AuthContextValue {
-  const ctx = useContext(AuthContext);
-  if (!ctx) {
-    throw new Error("useAuth must be used within an AuthProvider");
-  }
-  return ctx;
-}
+```javascript
+// User clicks "Login with GitHub"
+window.location.href = '/auth/oauth/github';
 ```
 
-## What each piece is actually doing
+The library handles the OAuth flow and redirects back to your frontend with a session token.
 
-**The mount-time `refresh()`.** The browser might already be holding a valid `goauth_session` cookie from a previous visit — React doesn't know that until it asks. `useEffect(() => { refresh() }, [])` calls `GET /auth/me` once on mount specifically to hydrate `user` from whatever cookie already exists, which is the whole reason `/auth/me` exists as a "check" endpoint rather than only being reachable as a side effect of login.
+## OAuth callback
 
-**`loading`, and why it starts `true`.** Until that first `refresh()` resolves, you don't yet know if there's a user or not — `loading` distinguishes "haven't checked yet" from "checked, and there's no one." Skipping this is what causes the common flash of a logged-out UI for a split second before a valid session kicks in; gate your route rendering on `loading` being `false`, not just on `user` being non-null.
+After authorization, the provider redirects back to `/auth/oauth/github/callback`. The library exchanges the code for an access token, fetches user info, and either logs in the user or creates a new account.
 
-**`setUnauthorizedHandler(() => setUser(null))`.** This is why [Setup](./index.mdx) exports it. A session can die on the server — revoked, banned, or expired past its refresh window — while this tab still has `user` set in memory from the last successful call. The next request that happens to hit the API will get a `401` (or `403 user_banned`), and this wiring means *any* request discovering that clears `user` app-wide, not just the component that made the unlucky call.
+The user is redirected to your frontend with either `token` or `error` in the URL.
 
-**Why `login`/`register` call `refresh()` again instead of using the response's own `user` field.** The login/register response already contains a full user object — you could use it directly and skip the extra round trip. Calling `refresh()` instead means there's exactly one code path that ever populates `user`, so it can't drift out of sync with what `/auth/me` would say. Either is correct; this trades a network call for not having two sources of truth.
+## Account linking
 
-## Using it
+Link an additional OAuth provider to the current user:
 
-Mount once, near the root:
-
-```tsx
-// app/layout.tsx
-import { AuthProvider } from "./auth-provider";
-
-export default function RootLayout({ children }: { children: React.ReactNode }) {
-  return (
-    <html>
-      <body>
-        <AuthProvider>{children}</AuthProvider>
-      </body>
-    </html>
-  );
-}
+```javascript
+// Redirect to provider for linking
+window.location.href = '/auth/oauth/link/github';
 ```
 
-Then anywhere below it:
+Or via API:
 
-```tsx
-function AccountMenu() {
-  const { user, loading, logout } = useAuth();
+```javascript
+await fetch('/auth/oauth/link', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ provider: 'github' }),
+  credentials: 'include'
+});
+```
 
-  if (loading) return <Skeleton />;
-  if (!user) return <a href="/login">Log in</a>;
+## Account unlinking
 
-  return (
-    <div>
-      {user.name}
-      <button onClick={logout}>Log out</button>
-    </div>
-  );
-}
+Unlink an OAuth provider:
+
+```javascript
+await fetch('/auth/oauth/unlink', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ provider: 'github' }),
+  credentials: 'include'
+});
+```
+
+The library prevents unlinking the only authentication method.
+
+## OAuth-only users
+
+Users who registered via OAuth have no password. They can set one later via `POST /auth/set-password`:
+
+```javascript
+await fetch('/auth/set-password', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    token: 'set-password-token',
+    password: 'new-secure-password'
+  })
+});
 ```
 
 ## Next
 
-- [Setup](./index.mdx) — the `apiRequest` helper and `setUnauthorizedHandler` this is built on
-- [Authentication client](./authentication.mdx) — `authApi`, including `me`/`check`
-- [Middleware](./middleware.mdx) — the server-side counterpart: redirecting unauthenticated requests before a page even renders
+- [Providers](../../providers/index.mdx) — available providers and setup
+- [Client integration](./index.mdx) — overview

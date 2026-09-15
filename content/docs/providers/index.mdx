@@ -1,15 +1,81 @@
 ---
 title: "Providers"
-description: "OAuth providers built into go-auth, and how registering one works."
-icon: "IdCard"
+description: "OAuth 2.1 providers for login, registration, account linking, and unlinking."
+icon: "KeyRound"
 ---
 
 # Providers
 
-An OAuth provider is anything implementing `port.OAuthProvider` — three methods: `Name() string`, `AuthURL(state, codeChallenge string) string`, and `Exchange(ctx, code, codeVerifier string) (*port.OAuthProfile, error)`. Register one with `WithProvider`, and its routes (`/auth/oauth/{provider}`, `/auth/oauth/{provider}/callback`, `/auth/oauth/{provider}/link`, `/auth/oauth/{provider}/unlink`) are mounted automatically — see [Routes](../routes.mdx#oauth--requires-enableoauth-and-at-least-one-registered-provider). You can register more than one provider at once; each needs a unique `Name()`.
+go-auth includes built-in OAuth 2.1 providers for login, registration, account linking, and unlinking. Providers are optional — register them via `WithProvider` to enable OAuth routes.
 
-For linking/unlinking a provider on an already-logged-in account and listing what's connected — rather than the initial sign-up/sign-in flow covered below — see [Guides → OAuth linking](../guides/oauth.mdx).
+## Setup
 
-Every built-in provider uses PKCE (S256) regardless of whether the provider strictly requires it — see [Security](../security.mdx#oauth) for why that matters.
+Register a provider:
 
-Currently built in: **GitHub** and **Google**. More can be added the same way `provider/github` and `provider/google` are built — implementing `port.OAuthProvider` against any OAuth2 provider's token and userinfo endpoints.
+```go
+import "github.com/nazimdjebloun/go-auth/providers/github"
+
+goauth.WithProvider(github.New(github.Config{
+    ClientID:     os.Getenv("GITHUB_CLIENT_ID"),
+    ClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
+    RedirectURL:  "https://myapp.com/auth/oauth/github/callback",
+}))
+```
+
+Each provider requires:
+
+- `ClientID` — The OAuth client ID from the provider.
+- `ClientSecret` — The OAuth client secret from the provider.
+- `RedirectURL` — The callback URL registered with the provider.
+
+## Available providers
+
+| Provider | Import path | Notes |
+|---|---|---|
+| GitHub | `github.com/nazimdjebloun/go-auth/providers/github` | |
+| Google | `github.com/nazimdjebloun/go-auth/providers/google` | |
+| Discord | `github.com/nazimdjebloun/go-auth/providers/discord` | |
+| Apple | `github.com/nazimdjebloun/go-auth/providers/apple` | |
+
+## OAuth flow
+
+1. User clicks "Login with GitHub" → redirected to `GET /auth/oauth/github`.
+2. Provider redirects back to `GET /auth/oauth/github/callback` with a code.
+3. Library exchanges the code for an access token, fetches user info.
+4. If the user exists (by email), they are logged in. If not, a new account is created (when `EnableOAuth` is true).
+5. User is redirected to the frontend with a session token.
+
+## Account linking
+
+Authenticated users can link additional OAuth providers via `POST /auth/oauth/link`:
+
+```json
+{
+  "provider": "github"
+}
+```
+
+This redirects to the provider's authorization URL. After authorization, the provider is linked to the current user's account.
+
+## Account unlinking
+
+Authenticated users can unlink OAuth providers via `POST /auth/oauth/unlink`:
+
+```json
+{
+  "provider": "github"
+}
+```
+
+The library prevents unlinking the only authentication method — if a user has no password and no other linked provider, unlinking is rejected.
+
+## Provider behavior
+
+- **Production** — Providers are stateless. No OAuth state is written to the database.
+- **Email matching** — OAuth users are matched by email. If the email exists, the provider is linked. If not, a new account is created (when `EnableOAuth` is true).
+- **Password** — OAuth-only users have no `password_hash`. They can set one later via `POST /auth/set-password`.
+
+## Next
+
+- [Configuration](../configuration.mdx) — `WithProvider`
+- [Authentication guide](../guides/authentication.mdx) — login and registration flows

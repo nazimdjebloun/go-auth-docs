@@ -1,78 +1,124 @@
 ---
-title: "Authentication"
-description: "authApi — a named-method wrapper around register/login/logout and session checks, built on the apiRequest helper."
-icon: "KeySquare"
+title: "Client Authentication"
+description: "Login, registration, and session management from the client."
+icon: "LogIn"
 ---
 
-# Authentication client
+# Client Authentication
 
-Wraps every endpoint from the [Authentication](../authentication.mdx) guide into one object, `authApi`, built on the [`apiRequest`](./index.mdx) helper. This is the form you'd actually keep in an app — the raw calls on the guide page are there to show you the wire format, not to be copy-pasted one at a time.
+This guide covers how to implement login, registration, and session management from a frontend or mobile client.
 
-```ts
-import { apiRequest } from "./client"; // wherever you put the Setup page's helper
+## Registration
 
-const API_BASE = "https://api.myapp.com";
+Register a new user:
 
-export const authApi = {
-  register: (input: { email: string; password: string; name: string }) =>
-    apiRequest(API_BASE, "POST", "/auth/register", input),
+```javascript
+const response = await fetch('/auth/register', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    email: 'newuser@example.com',
+    password: 'secure-password'
+  }),
+  credentials: 'include'
+});
 
-  login: (input: { email: string; password: string }) =>
-    apiRequest(API_BASE, "POST", "/auth/login", input),
-
-  logout: () => apiRequest(API_BASE, "POST", "/auth/logout"),
-
-  me: () => apiRequest(API_BASE, "GET", "/auth/me"),
-
-
-  verifyEmail: (code: string) =>
-    apiRequest(API_BASE, "POST", "/auth/verify-email", { code }),
-
-  resendVerification: (email: string) =>
-    apiRequest(API_BASE, "POST", "/auth/verify-email/resend", { email }),
-
-  getInviteInfo: (token: string) =>
-    apiRequest(API_BASE, "GET", `/auth/invite/info?token=${encodeURIComponent(token)}`),
-
-  completeInviteRegistration: (input: {
-    code: string;
-    name: string;
-    password: string;
-    confirmPassword: string;
-  }) => apiRequest(API_BASE, "POST", "/auth/invite/register", input),
-};
-```
-
-Every method returns exactly what the matching endpoint documents — `authApi` doesn't reshape responses or swallow errors, it only fills in the method/path/body so call sites don't have to repeat them. `register`/`login`/`logout`/`verifyEmail`/`resendVerification`/the invite methods are documented on the [Authentication](../authentication.mdx) guide; `me` and `check` are documented on [Sessions → Checking who's logged in](../sessions.mdx#checking-whos-logged-in) — they live on `authApi` rather than `sessionsApi` because that's where this codebase's own reference frontend keeps them.
-
-## Using it
-
-```ts
-const result = await authApi.login({ email, password });
-
-if (result.requiresVerification) {
-  // show a "verify your email" screen
+const data = await response.json();
+if (data.email_verified === false) {
+  // Show email verification prompt
 } else {
-  setUser(result.user); // cookies are already set by the browser
+  // Registration successful, user is logged in
 }
 ```
 
-```ts
-try {
-  await authApi.register({ email, password, name });
-} catch (err) {
-  // err is the parsed { error, message } body — see Error Handling
-  showError(err.message ?? err.error);
+## Login
+
+Login with email and password:
+
+```javascript
+const response = await fetch('/auth/login', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    email: 'user@example.com',
+    password: 'correct-password'
+  }),
+  credentials: 'include'
+});
+
+const data = await response.json();
+if (data.pending_2fa) {
+  // Show 2FA code input
+  // After user enters code:
+  const verifyResponse = await fetch('/auth/2fa/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: '123456' }),
+    credentials: 'include'
+  });
+} else {
+  // Login successful
 }
 ```
 
-```ts
-await authApi.logout();
-setUser(null);
-window.location.href = "/login";
+## Checking authentication status
+
+Check if the user is authenticated:
+
+```javascript
+const response = await fetch('/auth/me', {
+  credentials: 'include'
+});
+
+const data = await response.json();
+if (data.active) {
+  // User is authenticated
+  console.log(data.user);
+} else if (data.pending_2fa) {
+  // User needs to complete 2FA
+} else {
+  // User is not authenticated
+}
+```
+
+## Logout
+
+Logout and terminate the session:
+
+```javascript
+await fetch('/auth/logout', {
+  method: 'POST',
+  credentials: 'include'
+});
+```
+
+## Password reset
+
+Request a password reset:
+
+```javascript
+await fetch('/auth/forgot-password', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email: 'user@example.com' })
+});
+```
+
+Reset with the code:
+
+```javascript
+await fetch('/auth/reset-password', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    email: 'user@example.com',
+    code: '123456',
+    password: 'new-secure-password'
+  })
+});
 ```
 
 ## Next
 
-- [Setup](./index.mdx) — the `apiRequest` helper this is built on
-- [Authentication](../authentication.mdx) — full request/response/error reference for each of these endpoints
+- [Middleware](./middleware.mdx) — session validation middleware
+- [OAuth](../oauth.mdx) — OAuth login and account linking

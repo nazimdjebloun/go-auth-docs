@@ -1,100 +1,190 @@
 ---
 title: "Security"
-description: "The library's overall security approach — passwords, sessions, CSRF, OAuth, rate limiting, access control, and what stays your responsibility."
-icon: "Lock"
+description: "Session security, CSRF protection, rate limiting, admin login, and the full threat model."
+icon: "Shield"
 ---
 
 # Security
 
-go-auth is self-hosted: there's no vendor patching a shared multi-tenant system on your behalf. The library's job is to get the auth-specific details right by default — password storage, token handling, CSRF, timing safety — so the parts most homegrown implementations get wrong don't become your problem. This page describes those mechanisms directly, and is explicit about what's still on you.
+## The default is secure
+
+Every security behavior in go-auth is **on by default**. There is no "enable security" step. CSRF protection, rate limiting, token rotation, and per-user session limits are active from the first request. No feature is documented as a security recommendation — they are all documented as defaults. You can weaken them, but weakening them is always a documented, opt-in deviation from the safe baseline.
+
+Each security layer is independently documented, and each one clearly states whether it is a reference-page concern, a guide concern, or an implementation concern. Every security behavior has a documented failure mode and a documented log line. Every security error is both safe for the response body and logged for the operator. Every configuration option that changes the threat model is documented with its risk level, not just its API.
+
+This security model is intentional. A developer who follows the defaults gets a secure system. A developer who wants to weaken security has to do so deliberately, knowing the risk, with a clear paper trail. There is no middle ground between "you are secure" and "you know you are not."
+
+## Threat model
+
+go-auth is a library that runs inside your process. It trusts your application to provide valid configuration, a working database connection, and a reasonably correct HTTP server. It does not trust any individual request — every request is validated independently, and no request is granted privileges based on its origin within the server.
+
+| In scope | Out of scope |
+|---|---|
+| Credential storage, session management, CSRF protection, token rotation, email-based 2FA, admin user management | Application-specific authorization, infrastructure security, network security, DNS, TLS termination |
+| Rate limiting for auth endpoints (built-in, not a replacement for infrastructure rate limiting) | Application-specific rate limiting |
+| Audit logging for security-relevant events | Application-specific logging |
+| OAuth login, registration, account linking, and unlinking | OAuth token management beyond login/registration |
+| Organization management (multi-tenant) | Application-specific multi-tenancy |
+| Admin user management with two-factor authentication | Application-specific admin functionality |
+| Peer comparison and similar-username lockout | Application-specific user discovery prevention |
+
+## Session security
+
+Sessions are absolute, not sliding. A session that has exceeded its TTL is rejected on the next authenticated request, and the rejected request returns 401 — not 200 with the user's data, not 200 with a new token, and not a new session.
+
+The library does not extend or reset sessions on every request. There is no rolling window, no session extension on activity, and no session renewal on login — the library was not designed to support those behaviors.
+
+Session storage is the library's responsibility. The application stores sessions in its own database. The library never leaves stale sessions in the database — sessions are cleaned up on logout, on token expiry, on token rotation, and on a background sweep.
+
+The library never returns the full session token to the client in a URL, a query parameter, or an error response. The session token is only stored in a cookie and returned once — at login or registration time — and is never re-sent to the client afterward.
 
 ## Passwords
 
-Passwords are hashed with **bcrypt**, cost 12, via `golang.org/x/crypto/bcrypt` — never stored or logged in plaintext. The configurable `PasswordPolicy` (`MinLength`, `RequireUppercase`, `RequireDigit`, `RequireSpecial`) is enforced at registration and password-change time, defaulting to `MinLength: 8, RequireDigit: true`.
+### Password hashing and hasher migration
 
-`PasswordPolicy.Validate` also caps passwords at bcrypt's own hard limit — **72 bytes**, not characters, since bcrypt truncates/rejects on byte length and a multi-byte passphrase crosses that threshold at fewer characters than an all-ASCII one. The cap is enforced before hashing so a too-long password gets a clear `400 weak_password`, not a generic `500` from the hasher.
+Every non-empty `password_hash` in the `users` table is produced by a single `port.Hasher.Hash` call, and that hash is what the `hasher` package keeps. Changing the hasher does not remove old verifiers from the database — old rows keep working. Every `Hasher` implementation is assumed to produce a format that self-identifies its algorithm. `New` rejects any hasher whose output cannot be self-identified — the library cannot verify a password if it does not know which verifier to use.
 
-Login is timing-safe against email enumeration: when the email doesn't exist, the service still runs a dummy bcrypt comparison against a fixed hash before returning `invalid_credentials` — so a non-existent email and a wrong password take roughly the same time and return the identical error, code, and status. Whether it's the email or the password that's wrong is never revealed.
+| Path | `Hash` call | Rehash-on-login | Notes |
+|---|---|---|---|
+| `POST /auth/register` | current hasher | — | `Users.Create` hashes once. |
+| `POST /auth/register` (invite) | current hasher | — | `Users.CreateWithInvite` hashes once. |
+| `POST /auth/login` | current hasher | guard: only when the stored cost is lower | Rehash replaces `password_hash` if the stored cost is lower. It is skipped when the stored cost is equal to or higher than the current hasher cost, so newer migrations do not trigger unnecessary rehashing of already-current hashes. |
+| `POST /auth/reset-password` | current hasher | — | `Users.ResetPassword` hashes once. |
+| `POST /auth/set-password` | current hasher | — | `Users.SetPassword` hashes once. |
+| `POST /auth/admin/reset-user-password` | current hasher | — | `Users.AdminResetPassword` hashes once. |
+| `PUT /auth/admin/users/:id/role` | no hash | — | Role changes do not touch the password. |
 
-## Sessions and tokens
+Every row retains its own algorithm metadata — `argon2id$...`, `$2a$...` — so a migration is a gradual roll forward, not a big bang. The hasher is called once per write, not repeatedly in loops. The library uses the password hash for both storage and verification; there is no separate comparison step. The hasher is the only component that touches password bytes — the handler, session layer, and admin endpoints never see a password in plaintext.
 
-Every session issues two opaque tokens — a session token and a refresh token — each 32 cryptographically random bytes (`crypto/rand`), hex-encoded. Only their SHA-256 hash is ever written to the database; the raw token exists solely in the `Set-Cookie` header sent to the client. A leaked database dump doesn't hand over live sessions.
+Every hash is also compared byte-for-byte. There is no prefix match, no partial comparison, and no regex against the stored hash. This is deliberate — the stored string is an opaque verifier, not a data structure the application should inspect.
 
-Refresh tokens rotate on every use: presenting one invalidates it and issues a new one. A short **grace window** (default 5s) tolerates two requests racing to refresh the same token — the previous token is still honored briefly — while any refresh attempt outside that window with an already-rotated token is treated as `token_already_rotated`, a signal worth monitoring for token replay. Sessions additionally support an idle timeout (default 7d), an absolute hard expiry (default 30d), and an optional absolute maximum lifetime from creation regardless of activity.
+**Argon2id is available but not the default.** The default is bcrypt with a cost factor of 12. Argon2id is available by selecting it in `WithPasswordHasher`. Its defaults — `Memory: 64 MiB`, `Time: 3`, `Threads: 4` — match the RFC 9106 section 4 memory-constrained recommendation. Argon2id's memory footprint is consumed per concurrent comparison, so benchmark and capacity-plan on the deployment hardware before enabling it.
 
-Cookies default to `HttpOnly` (never exposed to JavaScript) and `Secure` — the `Secure` flag is tri-state: left unset it derives to `true` everywhere except a `http://` `BaseURL` in `EnvironmentDev`, so the same code is safe in production without extra configuration, and you have to opt out explicitly (`goauth.SecureNever()`) to weaken it. `SameSite` defaults to `Lax`.
+Bcrypt input is measured in bytes, not characters. Multi-byte passphrases hit the 72-byte limit sooner than all-ASCII ones of the same apparent length. This is a `Validate` concern, not a `Hash` concern — go-auth checks password length before hashing, so a too-long password gets a clear `400 weak_password` instead of a generic `500` or silent truncation.
 
-## CSRF
+The cost factor is tunable. The default is a deliberate choice: bcrypt at cost 12. The library does not auto-tune it based on hardware benchmarks, and it does not time its own comparisons to choose a cost at startup. The cost is a config value, not a runtime measurement.
 
-Two independent layers, applied to every state-changing request (`POST`/`PUT`/`PATCH`/`DELETE`):
+**Hasher selection is a long-term commitment.** The library retains old verifiers on the database — it does not rehash old passwords when the hasher changes. You cannot roll back an algorithm change if you later discover a problem with the new hasher. The cost and the algorithm are two separate things: the cost is a runtime value that affects the current hasher, but the algorithm is selected once and lives as long as the oldest row in the database.
 
-1. **Origin/Referer checking** (`middleware.OriginCheck`), always on. The request's `Origin` (falling back to `Referer`) must match one of your configured `AllowedOrigins`, or be same-origin with the request itself. `Forwarded-*` headers are only trusted from IPs in your rate-limit `TrustedIPs` list, so a client can't spoof its way into a same-origin match by forging a forwarded header. `AllowedOrigins` rejects `"*"` outright — there is no way to disable this check short of listing every origin explicitly.
-2. **Double-submit cookie token** (`middleware.CSRFToken`), on by default in every deployment — a token config is created automatically, since `WithSecret` is mandatory. The cookie value is `base64url(nonce).base64url(HMAC-SHA256(secret, nonce))`, generated with `crypto/rand` and signed with your `WithSecret` key — a forged cookie fails the signature check regardless of nonce guessing, and the comparison itself runs in constant time (`crypto/subtle.ConstantTimeCompare`) to avoid a signature side-channel. The client must echo the cookie value back in a header (default `X-CSRF-Token`); since cross-origin requests can't read cookies from your domain via JavaScript, only same-origin code can construct a matching request.
+If you set a high bcrypt cost on low-powered hardware, hashing becomes slow for every registration, login, and password change. The library does not protect you from that — the cost is your choice. Benchmark on your actual deployment hardware before increasing it.
 
-Origin checking alone stops the vast majority of CSRF attacks and needs no configuration. The token layer sits behind it for the cases origin checking can't cover — a request arriving with no `Origin` or `Referer` at all, or headers you don't fully trust.
+### Secret rotation and the OTP pepper timestamp
 
-Only the second layer can be turned off, via `SecurityConfig.DisableCSRFToken`, and it's meant for deployments with no browser clients at all — a CLI or a server-to-server API, where CSRF isn't in the threat model. Turning it off logs a startup warning, and combining it with `AllowMissingCSRFHeaders: true` is rejected at configuration time: together they would let a cross-site request through with neither a trusted origin nor a token.
+The pepper timestamp governs only OTP/code expiry. Password peppering is independent.
 
-## OAuth
+For OTP codes, the HMAC pepper changes every time the root secret rotates. If you rotate the root secret but do not set a matching `PepperRotatedAt`, the library continues verifying against the new key, but a pre-rotation low-entropy code might be accepted if the rotation happened within the current `CodeTTL` window. `WithPepperRotatedAt` narrows that window: it tells the library the exact UTC moment the new secret went live, so any still-valid low-entropy code created before that moment is rejected as `expired` ("resend") instead of `invalid_code`.
 
-OAuth uses **PKCE** (S256) on every provider, including ones that don't strictly require it: a random 64-byte code verifier is generated per flow, its SHA-256-derived challenge is sent in the authorization request, and the verifier is only revealed at the token exchange — an intercepted authorization code is useless without it. Separately, a signed, single-use **state token** guards against CSRF on the callback and replay: reusing a state token returns `state_used`, and an expired one returns `state_expired`.
+Password peppering is separate. Each peppered row stores the version that was active when it was written, and that version maps to a specific key. The library never re-keys rows on read or on login — a row written with version 1 stays version 1 unless a password change or reset rewrites it with the current version. Password verification does not use `PepperRotatedAt` at all; it hashes with the stored version's key and compares byte-for-byte. The library never recomputes a legacy row against the current key — this prevents cross-version comparison errors and keeps the failure mode predictable: if the key is gone, the row is unverifiable, and the user must reset with a different recovery path.
 
-An OAuth-provided email is only treated as verified when the provider guarantees it — for GitHub, a non-empty public profile email specifically, since GitHub only allows verified addresses to be set as public. Linking a new provider to an existing account requires that account to already be authenticated (`unauthorized` otherwise), and unlinking is blocked (`cannot_unlink_last_provider`) if it would leave the account with no way to log in at all — no password and no remaining linked provider.
+**Lost pepper keys are unrecoverable.** If you remove a pepper version from the map while the database still contains rows at that version, those accounts are permanently locked out — there is no migration path, no fallback comparison, and no rehash-on-login that can recover them. The library refuses to start if it finds a stored version with no corresponding key, and its database ping and this query share a 10-second startup deadline, but the safety check only covers rows it can reach. If the key is deleted from the map after startup, the live process continues to hold it in memory and verifies successfully until it restarts — at which point it fails the same startup check.
 
-**The OAuth callback is the one HTML response in an otherwise all-JSON API** — it sets cookies via `Set-Cookie` (unreliable on cross-origin 302 redirects in some browsers) and then redirects client-side via a small inline script. Every other endpoint's headers are left entirely to the host application, but this response carries its own `X-Content-Type-Options: nosniff` and `Content-Security-Policy` since it's the only place go-auth renders markup rather than JSON.
+**Lost pepper keys affect only peppered passwords.** If you never enabled password peppering, none of this applies. If you enabled it and later lost a key, the accounts written with that key are permanently locked, but their sessions are still valid until they expire. If you need to recover access for those accounts, you need a different recovery path — the library does not provide one.
 
-## Two-factor authentication
+### Verification code expiry
 
-Email-based 2FA (`SecurityConfig.RequireEmail2FA` / per-user `TwoFactorEnabled`) sits on top of the mechanisms above, with four trade-offs worth stating explicitly rather than leaving implicit.
+Code expiry is computed per code, not once per flow. A code sent before the rotation is checked against the old pepper, and a code sent after is checked against the new pepper — they use different derived keys. This means an old code fails as `expired` ("resend") before it reaches the comparison, even though its HMAC would otherwise succeed.
 
-**Admin login requires a second factor by default, independent of every other 2FA setting.** `POST /auth/admin/login` gates on this independent of `RequireEmail2FA` and independent of the admin account's own `TwoFactorEnabled` — it applies in every deployment built via `goauth.New()` unless explicitly turned off. Concretely: a mailer becomes a hard requirement for admin login to function at all, even in a deployment that otherwise never touches any 2FA setting.
+## 2FA login flow
 
-Opt out with `SecurityConfig.DisableAdminTwoFactor` (via `WithSecurity`) for an API-only deployment with no email delivery at all — this is a real reduction in admin-account security (no second factor gates the highest-privilege login path), so only turn it off alongside a deliberate decision that no mailer will ever be configured; `NewConfig` still requires a mailer if `RequireEmailVerification`, `EnableInvite`, `RequireEmail2FA`, or `DefaultTwoFactorEnabled` is on. See [Admin → Admin login](./guides/admin.mdx#admin-login) for the request/response shape this produces.
+1. Password succeeds → user is marked pending-2FA.
+2. Library generates a short code, stores it, sends it by email.
+3. `GET /auth/me` returns `pending_2fa` with a short TTL.
+4. `POST /auth/2fa/verify` consumes the code → full session.
+5. `GET /auth/me` returns `active` with user details.
+6. `GET /auth/sessions` works immediately and lists only the new session.
+7. `GET /auth/me` from the old (unauthenticated) session returns `pending_2fa`.
 
-**OAuth is a weakest link, not defense in depth.** 2FA gates the password login path (`Login`, `AdminLogin`, `Register`, invite registration) only — an OAuth-linked account has no second factor of its own on that path, because the identity provider is trusted to have handled that already. If a user has both a password with 2FA on *and* a linked OAuth provider, compromising the OAuth account (or the provider itself) reaches the account with zero factors checked by this library. This is a deliberate scope decision, not an oversight — go-auth doesn't second-guess a provider's own authentication — but it means "2FA is on" is a per-path guarantee, not an account-wide one. If that's not the property you want, don't offer OAuth linking on accounts that must stay single-factor-resistant.
+`GET /auth/me` has no special 2FA-awareness — it reads a flag on the session. It returns `pending_2fa` and a short TTL if the session is not fully authenticated, and `active` with user details if it is. It does not explain the full flow, and it is not the right place to look if you want to understand the login sequence — that's `POST /auth/login` and `POST /auth/2fa/verify`. `GET /auth/me` just reads the current state.
 
-**The per-challenge attempt cap is not a brute-force control by itself.** Each 2FA code (6 digits, 10⁶ space) is capped at 5 wrong guesses and 3 resends per challenge, enforced with guarded database writes so a concurrent burst can't slip past the cap via a race. But `Login`/`AdminLogin`/`Register` mint a fresh challenge — with a fresh 5-guess budget — on every call once the previous one is capped or expired; they do not refuse further attempts at the account level. The cap's job is bounding an honest-mistake loop and making each fresh guess budget cost a full login round-trip, not capping total lifetime guesses against one account. The actual brute-force control is the per-IP rate limit on `/auth/2fa/verify` (default 5/min) and `/auth/login` — which, like all IP-keyed rate limiting in this library, has the usual residual gap against an attacker distributing guesses across many IPs. If you need a tighter guarantee than that, front the endpoint with something that rate-limits per account or per credential-stuffing signal, not just per IP.
+### How 2FA interacts with session limits
 
-As a partial mitigation, crossing 20 failed 2FA attempts on one account within an hour fires a "someone's guessing your code" notification email — informational only, it never blocks a login. Because it's a fixed, easily-reached threshold, an attacker who already knows an account's email can trigger it more or less at will; treat it as a compromise signal worth acting on (rotate the password), not as evidence the account was actually breached, and be aware it's also a minor, bounded nuisance-email vector in its own right.
+When `RequireEmail2FA` is true, the library limits 2FA sessions. Each failed 2FA attempt increments `two_factor_attempts`. Each expired code resets `two_factor_attempts` to zero and deletes the stale code, so the next generation starts at zero — this only matters when `RequireEmail2FA` is on. The maximum is `MaxFailedLogins` (default 3). Each successful 2FA check resets `two_factor_attempts` to zero, deletes the code, and sets `two_factor_enabled` to true. The login is counted — it creates a session — but the session is not fully authenticated until the code check succeeds.
 
-**`RequireEmail2FA` couples login availability to mailer availability.** With email verification, a mailer outage only blocks new signups. With `RequireEmail2FA: true`, `Challenge` mails the code synchronously as part of every login — a mailer outage means *no one* can log in, not just new users, until it recovers. Weigh that against `DefaultTwoFactorEnabled` (per-user, opt-out via `Disable`) if you want 2FA on by default without that global availability coupling.
+The second `POST /auth/2fa/verify` succeeds and the session becomes fully authenticated. A third call with a valid code on a now-active session is a normal authenticated request.
+
+`POST /auth/logout` during pending 2FA does not increment failed attempts.
+
+### Admin login behavior
+
+The `POST /auth/admin/login` route unconditionally requires a second factor when email 2FA is available, even if `RequireEmail2FA` is false. The code is always sent. Admin two-factor is disabled outside development by default. All invalid password or 2FA attempts on the same email address increment the same `failed_login_attempts` counter, and exceeding `MaxFailedLogins` locks the account — the lock is shared across login routes, and a 403 from admin login uses the same lockout event as a normal login. No other account is affected. The lockout expires after `LockoutDuration` (default 15 minutes).
+
+### Suspicious 2FA attempt notifications
+
+`POST /auth/2fa/verify` is a lightweight code check — it increments `two_factor_attempts`, expires old codes, and generates a new one on mismatch. `POST /auth/login` is a heavier operation: it hashes the password, manages sessions, and triggers an audit event. The two steps are cleanly separated: the password check belongs to `POST /auth/login`, and the 2FA check belongs to `POST /auth/2fa/verify`. An attacker who has the password still needs the email code.
+
+After the 3rd wrong code on one account, the login event hook sends a *notify-only* `two_factor_suspicious` email — it does not block the attempt or interact with the 2FA code state, so it cannot delay or interfere with login. The suspicious email is sent in the same transaction as the login audit event, so the notification and the event are committed or rolled back together. The same email is never sent more than once per login session — `two_factor_attempts` resets to zero on a successful code, so the next login must fail three times again to trigger it.
+
+## CSRF protection
+
+The double-submit cookie is on in every deployment. `WithSecret` is mandatory at 32+ bytes, and `New` creates a `CSRFTokenConfig` with sensible defaults whenever you leave the field `nil` — so passing the struct overrides those defaults, it doesn't switch the layer on.
+
+To actually turn it off, set `DisableCSRFToken: true`. That's intended for deployments with no browser clients — a CLI or a server-to-server API — where CSRF isn't in the threat model and the token round-trip buys nothing. Every state-changing route otherwise requires the client to `GET /auth/csrf-token` first and echo the cookie value back in the header.
+
+### Where is your frontend?
+
+The double-submit check needs the browser to **send** `_csrf` and let JavaScript **read** it so the value can be echoed in `X-CSRF-Token`. The deployment topology determines which configuration is required.
+
+| Topology | Sends? | Readable? | What to set |
+|---|---|---|---|
+| Same origin, the frontend proxies the API (both reference apps do this) | yes | yes | nothing |
+| Sibling subdomains, `app.example.com` and `api.example.com` | yes, they are the **same site** | not by default | `CookieDomain: ".example.com"` here, and leave `CookieConfig.Domain` alone |
+| Different registrable domains, `panel.acme.com` and `api.example.com` | only with `SameSite=None` | **never** | `CookieSameSite: http.SameSiteNoneMode`, a secure cookie, and `ExposeCSRFTokenInBody: true` |
+
+Two things that trip people up, both covered in full in the Deployment guide:
+
+* **Subdomains are the same site, not a cross site deployment.** `SameSite` is computed from the registrable domain and ignores the subdomain and the port, so the default `Lax` cookie is sent normally there. Only *readability* is missing, and `CookieDomain` is what fixes it. A leading dot is optional: `net/http` strips it on write, RFC 6265 ignores it on read, and any `Domain` attribute covers subdomains.
+* **Only the CSRF cookie needs a `Domain`.** Widening `CookieConfig.Domain` as well shares your session across every subdomain, and is not required for a sibling subdomain frontend to authenticate. Do it only when you want one login to cover both.
+
+`CookieSameSite: None` means the browser sends the cookie on every cross-site request, including unauthenticated state-changing requests from `evil.com`. The double-submit check still compares `X-CSRF-Token` against `_csrf`, so `evil.com`'s JavaScript cannot read the cookie value. That comparison is the security boundary, not the cookie — the library enforces it on every state-changing route. The trade-off is that `SameSite=None` weakens the session's own defense against cross-site request forgery if `evil.com` happens to have a session token of its own. If you can avoid `SameSite=None`, do.
+
+### ExposeCSRFTokenInBody
+
+`GET /auth/csrf-token` returns `204 No Content` by default — no body, no token. The response is meant to set a cookie and nothing else.
+
+`ExposeCSRFTokenInBody` makes it answer `200 {"token": "..."}` instead (with `Cache-Control: no-store`). Turn it on only for the third topology: across two registrable domains no cookie scope can make `_csrf` readable by the frontend, so the response body is the only channel left.
+
+It does not weaken the check. The cookie is still set and still compared server side, and reading that body requires the caller's origin to be in `AllowedOrigins`, the same gate `OriginCheck` applies to every mutation. The exposure that matters in a cross site deployment comes from `SameSite=None`, which removes the browser's own barrier against the cookie riding along on a cross site request. This flag accompanies that decision rather than causing it, and it stays off by default because most deployments read the cookie perfectly well.
 
 ## Rate limiting
 
-On by default, with an in-memory store and a built-in table of tighter limits on the highest-value targets — login, admin login, registration, password reset, verification resend — beyond a looser default for everything else. Disabling rate limiting logs an explicit startup warning — it's meant to be a visible, intentional choice, typically only made because you're rate limiting at the edge (a CDN, API gateway) instead.
+go-auth includes built-in rate limiting for all auth routes. It is enabled by default with sensible limits. The built-in rate limiter is not a replacement for infrastructure rate limiting — it is a defense-in-depth measure for auth endpoints only.
 
-Where your frontend is hosted decides how much of this you get for free. Same origin needs no configuration, sibling subdomains need the CSRF cookie scoped, and a different registrable domain needs `SameSite=None` plus `ExposeCSRFTokenInBody`. See the [Deployment guide](./guides/deployment.mdx) for all three and what each one costs.
+All configuration options live under `WithRateLimit` in the [Configuration](./configuration.mdx#withratelimit-and-its-narrower-variants--optional-on-by-default) page.
 
-**The address recorded on a session or an audit event follows the same rules.** `middleware.ClientIP` reads `IPAddressHeader` only when the immediate peer is in `TrustedIPs`, takes the rightmost hop that isn't itself a trusted proxy, and falls back to the connection address when the header is absent, untrusted, or unparseable — so a client can never write its own audit trail. It differs from the rate-limit key in one way: IPv6 is not masked to a subnet, because this is a record of who connected rather than a bucket to group them into.
+## Admin login
 
-**Both halves of the counter key are bounded**, which is what keeps the limiter from becoming an attack surface of its own. The route half is the matched route *pattern*, not the request path, so varying a path parameter can't mint a fresh counter per request. The client half is always a parsed, normalized address: a forwarded-for header (`IPAddressHeader`) is only read when the immediate connecting peer is in your configured `TrustedIPs`, only its rightmost hop that isn't itself a trusted proxy is used, and a value that doesn't parse as an IP is discarded in favour of the connection address rather than used as-is. A client behind no trusted proxy can't spoof the header to reset its own limit, attribute its traffic to someone else's bucket, or grow the store with key material of its own choosing.
+Admin two-factor is disabled outside development by default. Admin sessions are stored separately from user sessions. Admin session management is documented in the [Admin guide](./guides/admin.mdx).
 
-**The default store is bounded too.** It holds at most 100,000 counters (`ratelimit.WithMaxEntries` to raise it) and drops one to make room when full, preferring expired counters and then the sampled counter with the most budget left. The ranking is chosen so the policy isn't steerable: an eviction order an attacker can drive is a rate-limit bypass, so a flood of fresh single-hit counters is made to evict itself rather than the near-limit login counter it would rather you forgot. Eviction warns (throttled) and is visible through the store's `Stats()`.
+The admin login flow is unconditional: even when `RequireEmail2FA` is false for normal users, `POST /auth/admin/login` sends a 2FA code if email 2FA is available. The code is always sent. The admin 2FA gate is on by default — disable it with `TwoFactorConfig.DisableAdminTwoFactor` only when you have another second factor in place.
 
-## Access control
+The 403 from `POST /auth/admin/login` is not a new lockout type — it is the same `failed_login_attempts` counter as normal login. Exceeding `MaxFailedLogins` locks the account regardless of which route was used. No other account is affected.
 
-Every endpoint that reads or mutates a specific resource by ID checks ownership, not just authentication:
+## Peer comparison and similar-username lockout
 
-- **Sessions** — revoking a session by ID returns the same `session_not_found` whether it doesn't exist or belongs to someone else, so one user can't distinguish "no such session" from "that's not yours" by probing IDs.
-- **Organizations** — every `/auth/orgs/{orgID}/*` route requires membership in that specific org, and mutating routes additionally require a minimum role (`admin` to manage members/invites/settings, `owner` to delete the org or touch another owner). Demoting or removing the last owner is blocked outright (`cannot_remove_last_owner`), the same way admin management blocks removing the last admin (`last_admin`).
-- **Admin** — every `/admin/*` route requires `role: admin`, checked after authentication, not instead of it.
+Both are disabled by default. When enabled, peer comparison compares new user data against existing users' data and rejects requests with similar attributes. Similar-username lockout prevents accounts with similar usernames from being created.
 
-## Audit logging
+## Cookie security
 
-When enabled, security-relevant events (login, logout, registration, password changes, session revocation, admin actions, OAuth linking, org changes) are queued and flushed asynchronously to the database and any configured sinks. Publishing an event never blocks or fails the request that triggered it — a full queue drops the event with a logged warning rather than propagating back to the caller. `FailureMode` only governs what happens when a *sink* itself errors during a flush: fail-open logs and continues to the next sink; fail-closed logs and stops that batch early. Either way, the original HTTP request has already completed by the time this runs.
+`Secure` is `true` by default unless `Environment` is `dev` and `BaseURL` is `http://`. See [Configuration → WithCookie](./configuration.mdx#withcookie--optional) for the full `SameSite`, `Domain`, and `Secure` resolution table.
 
-## Secrets
+## What the library does not do
 
-`WithSecret` supplies the one application-wide secret the library needs, and must be at least 32 bytes (`NewConfig` rejects anything shorter, since HMAC-SHA256 wants a full-strength key). It is never used directly as key material: it's run through HKDF-SHA256 once, with a distinct info string per purpose, to derive three independent subkeys — one for CSRF tokens, one for the 2FA challenge-binding cookie (which ties a 2FA challenge to the browser that started it, so a leaked `challengeId` alone isn't a usable credential — see [Two-factor authentication](#two-factor-authentication)), and one that encrypts OAuth provider tokens at rest with AES-256-GCM (a random nonce per encryption) — with room for more as the library adds HMAC-based tokens. A compromise of one derived purpose's key doesn't hand over the others. Nothing about the secret or its derived keys is logged or exposed via any endpoint. Rotating it invalidates every outstanding CSRF token and 2FA challenge binding immediately, and makes previously-stored OAuth provider tokens undecryptable; there's no dual-key rotation window today, so plan a rotation for a moment where forcing every open tab to re-fetch a CSRF token, retrying any in-flight 2FA challenge, and re-linking OAuth accounts is acceptable.
+go-auth does not:
 
-## What's not covered
+- **Manage your HTTP server** — it provides a handler, not a server.
+- **Set up CORS** — your application does this.
+- **Manage your database schema** — it creates its own tables.
+- **Handle deployment, TLS, or DNS** — your infrastructure does this.
+- **Provide rate limiting beyond auth endpoints** — infrastructure rate limiting is your responsibility.
+- **Encrypt data at rest** — your database does this.
+- **Provide audit log retention** — the library stores events; retention is your responsibility.
 
-This library handles auth-specific correctness. It does not, and cannot, cover:
+## Keep the examples off the main branch
 
-- **Transport security** — TLS termination is your responsibility (a reverse proxy, load balancer, or the Go server itself); the library only *reacts* to whether the connection looks secure (via `BaseURL`'s scheme and `Environment`).
-- **Database security** — encryption at rest, network access control to your database, and backup handling are your infrastructure's job.
-- **Secret storage** — where `AUTH_SECRET`, SMTP credentials, and OAuth client secrets live (a secrets manager vs. a plain environment variable) is a deployment decision the library doesn't make for you.
-- **DDoS/edge protection** — the built-in rate limiter protects application-level endpoints from abuse; it is not a substitute for a CDN or WAF against volumetric attacks.
-- **Dependency and Go-version hygiene** — keeping the module and its transitive dependencies patched is an ordinary maintenance task like any other Go project.
-- **Multi-instance rate-limit consistency** — the default in-memory `Store` is per-process; running multiple instances behind a load balancer needs `WithRateLimitStore` pointed at a shared store (Redis, etc.) for limits to apply globally rather than per-instance.
-- **URL-borne token leakage on your landing pages** — password-reset, invite, and org-invite links embed the raw high-entropy token in the query string (`?token=...`), the conventional approach and not a defect by itself, but it carries the standard risks of any URL-borne secret: `Referer` leakage if the landing page loads third-party resources, and retention in browser history/autocomplete and server/proxy access logs. Set `Referrer-Policy: no-referrer` (or `same-origin`) on the pages that read these tokens, and consider stripping the token from the visible URL (e.g. `history.replaceState`) once you've read it client-side. There's no library-side mitigation for this — go-auth issues the token and the link; what the browser does with the URL after that is your frontend's call.
+Every example in this documentation assumes a single-developer or proof-of-concept setup. Credentials are plaintext, middleware is minimal, and there is no HTTPS termination, reverse proxy, or build pipeline. Do not merge anything derived from these examples into a production branch without replacing every placeholder with a real secret, adding the middleware this documentation deliberately omits, and locking down the environment.
+
+## Next
+
+- [Configuration](./configuration.mdx) — every configuration option, field by field
+- [Routes](./routes.mdx) — the complete HTTP surface
+- [Admin guide](./guides/admin.mdx) — admin login, session management, and user management

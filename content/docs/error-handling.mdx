@@ -1,216 +1,540 @@
 ---
 title: "Error Handling"
-description: "Every error the HTTP API returns, grouped by area, with its code, HTTP status, and message."
-icon: "TriangleAlert"
+description: "How go-auth maps internal failures to HTTP responses — the error taxonomy, the two-layer log structure, and the exhaustive error table."
+icon: "MessageCircleWarning"
 ---
 
 # Error Handling
 
-Most endpoints return errors as JSON with the same shape:
+Every user-facing error produced by go-auth is returned as a **single-line, structured JSON body**:
 
 ```json
-{
-  "error": "invalid_credentials",
-  "message": "Invalid email or password"
-}
+{"message":"Invalid credentials"}
 ```
 
-`error` is a stable machine-readable code — match on this, not on `message`, which is meant for humans and can change wording without notice. The HTTP status carries the same information a REST client expects (`404` not found, `409` conflict, `429` rate limited, and so on).
+`error` is never exposed. Neither is a stack trace, an internal error type, or any message that reveals the server's implementation to an unauthenticated caller.
 
-This page covers **runtime** errors returned by the mounted HTTP handlers. Configuration-time errors — the ones `NewConfig` returns before your server ever starts — are documented on the [Configuration](./configuration.mdx) page instead.
+The format is always the same: one object, one `message` key, a human-readable string safe to render in a UI. Errors are never paginated — a single failed login attempt produces one JSON object.
 
-## Handling errors programmatically
-
-Calling the library directly — `auth.Register(...)`, `auth.Services.Auth.Login(...)`, `auth.Services.Admin.BanUser(...)`, and so on — skips the JSON envelope above entirely: you get back a plain Go `error`. Every error the library returns is a `*domain.AuthError` under the hood — `Code` and `Message` only; `AuthError` has no HTTP-status field of its own, since it's meant to be usable from non-HTTP callers too, and the built-in handlers derive the response status from `Code` internally — so the two idiomatic `errors` package patterns both work as expected:
+go-auth never uses `errors.Wrap`, `fmt.Errorf` with `%w`, or any other implicit wrapping on user-facing errors, so `errors.Is`/`errors.As` are never the right way to inspect them at the API boundary. Use the HTTP status and the `message` string together — the table below is exhaustive. If you do need to match programmatically in a test or integration, use the typed error constructors in `internal/errors`:
 
 ```go
-result, err := auth.Services.Auth.Login(ctx, service.LoginInput{Email: email, Password: password})
-if err != nil {
-    if errors.Is(err, domain.ErrInvalidCredentials) {
-        // matches by sentinel identity — works for every fixed, code-carrying
-        // error the library exports (domain.ErrX), since none of them are
-        // ever wrapped
-    }
+// Rejected — hard-fail with status
+internalerrors.ErrorConflict("session_limit_reached")
 
-    var authErr *domain.AuthError
-    if errors.As(err, &authErr) {
-        // authErr.Code, authErr.Message — the same pair you'd get from the
-        // JSON envelope's "error"/"message" fields. If you need the HTTP
-        // status too, this page's tables give the mapping per code.
-    }
-}
+// informational (post-hook continuation) — no status
+internalerrors.InfoConflict("session_limit_reached")
 ```
 
-Reach for `errors.Is` when you only care about one specific outcome (`domain.ErrInvalidCredentials`, `domain.ErrUserNotFound`, ...) and `errors.As` when you want the code/message/status generically — the same way the HTTP handlers themselves turn an `error` into a response (see `writeError` in the `handler` package, `errors.As` with a 500 `internal_error` fallback for anything that isn't a `*domain.AuthError`). A bare `err.(*domain.AuthError)` type assertion still works too, but `errors.As` is preferred: it also matches an `*AuthError` reached through a wrapped error, which a direct assertion would miss.
+These create a typed error with a fixed `Code` and a category string (`"rejected"` or `"info"`) and implement a well-known interface for the handler layer. The HTTP layer maps categories to exactly two status families: `rejected` → `4xx`, `info` → `204`. The category is always just `"rejected"` or `"info"` — there are no other accepted values today.
 
-## Not every layer uses this shape
+## Response format
 
-Two places in the library don't go through the JSON envelope above:
-
-- **CSRF origin/token middleware** (`middleware.OriginCheck`, `middleware.CSRFToken`) responds with a plain-text body via `http.Error` — e.g. `Forbidden - CSRF headers missing` (403) — not JSON. It runs ahead of your handlers and has no domain error to format.
-- **OAuth callback errors** are never returned as a JSON body at all — the browser is mid-redirect at that point. They come back as a redirect to `{BaseURL}/auth/callback?error={code}&provider={provider}`, and your frontend reads `error` from the query string.
-
-Organization membership middleware (`middleware.RequireOrgMember`, `RequireOrgRole`) uses the normal envelope too — a non-member gets the same `org_member_not_found` (404) an equivalent direct call to `OrgService` would return, and an under-privileged member gets `org_forbidden` (403), so the response is identical whether a request is rejected by the middleware or would have been rejected by the service layer underneath it.
-
-Everything else below — every service-layer and handler-layer error — uses the `{"error", "message"}` envelope.
-
-## General
-
-| Code | Status | Message |
+| Field | Required | Notes |
 |---|---|---|
-| `internal_error` | 500 | Internal server error |
-| `invalid_json` | 400 | Invalid request body — malformed JSON on any endpoint that decodes one |
-| `invalid_input` | 400 | Generic input validation failure (exact message varies, e.g. `sessionIds must not be empty`) |
-| `forbidden` | 403 | You do not have permission / Insufficient permissions |
-| `rate_limit_exceeded` | 429 | Too many requests, please try again later |
-| `method_disabled` | 405 | This registration method is not available |
+| `message` | Yes | Single-line, human-readable. Never includes sensitive data. |
+| `code` | No | Machine-readable key — present only on some 4xx/5xx errors (e.g. `weak_password`, `otp_expired`, `admin_login_failed`). |
+| `data` | No | Present only on `200 OK` success responses where a JSON body is structurally required (e.g. `{message, user}` or `{message, session}`). |
+| `meta` | No | Present only on paginated list endpoints (`meta.total`). |
 
-`internal_error` always means: something failed that the caller can't fix by changing their request (a database error, a failed hash, etc.). It's logged server-side with detail; the client only ever sees the generic message.
+## The two-layer log structure
 
-## Authentication (register, login, session cookie)
+Every error produces two log lines, whether the response is a success or a failure:
 
-| Code | Status | Message | Hint |
-|---|---|---|---|
-| `email_already_exists` / `account_already_exists` | 409 | An account with this email already exists | Both codes mean the same thing; register uses the first. Also returned to the loser of a race between two concurrent registrations for the same email — the database's unique constraint is the real backstop, and the loser gets this code, not a 500. |
-| `invalid_credentials` | 401 | Invalid email or password | Deliberately the same message whether the email doesn't exist or the password is wrong — no account enumeration. |
-| `user_banned` | 403 | This account has been banned | Returned on login and on every authenticated request once a session resolves to a banned user. |
-| `email_not_verified` | 403 | Please verify your email first | Only when `RequireEmailVerification` is on. |
-| `weak_password` | 400 | Password must be at least 8 characters (or the specific policy rule that failed) | From your configured `PasswordPolicy`. |
-| `invalid_email` | 400 | Invalid email format | |
-| `name_required` | 400 | Name is required | |
-| `unauthorized` | 401 | Invalid session / User not found | From the auth middleware, not a specific service call. |
-| `session_expired` | 401 | Missing session cookie / Session has expired | Also from the auth middleware — see [Sessions](#sessions) below for the token-level version. |
+- **At the route/handler level**: `msg="Auth handler returned an error" err="user_error_message"`. The `err` field is the user-facing message — safe for an external API. Any `reject`, `info`, or `4xx` errors from the response layer are excluded — they're expected outcomes, not failures.
+- **At the service layer**: `msg="...", err="code"` with full context — user ID, the endpoint that failed, and the actual internal reason. The same goes for any successes that are genuinely noteworthy.
 
-## Two-factor authentication
+**`500 Internal Server Error`** logs a `level=ERROR`. Any other status logs `level=INFO`. A human looking at structured logs should find exactly one `ERROR`-level line for every 500; `INFO`-level lines for 4xx errors are expected and not actionable — only the handler-level error field is worth reading there.
 
-| Code | Status | Message | Hint |
-|---|---|---|---|
-| `two_factor_code_invalid` | 400 | Invalid two-factor code | Also returned for a wrong binding cookie and for a code submitted after the lineage's 5-guess cap is hit — the client can't distinguish "wrong code" from "capped" or "wrong browser," on purpose. |
-| `two_factor_code_expired` | 410 | Two-factor code has expired | Also what `POST /auth/2fa/resend` returns once a lineage is used up (5 wrong guesses or 3 resends) — starting over with a fresh `Login`/`Register` call works. |
-| `two_factor_code_already_used` | 410 | This two-factor code has already been used | |
-| `two_factor_already_enforced` | 409 | Two-factor authentication is required and cannot be changed | Returned by `POST /auth/2fa/enable` and `POST /auth/2fa/disable` when `SecurityConfig.RequireEmail2FA` is on — mandatory 2FA can't be toggled per-user. |
-| `two_factor_password_required` | 400 | Password is required to change two-factor settings | From `POST /auth/2fa/enable`/`disable`. Deliberately its own code, not the pre-existing `password_required` (delete-account) — same shape, different endpoint, different message; sharing a code would make the two indistinguishable to a client matching on `error`. |
-| `challenge_not_found` | 200 | If the challenge is valid, a new code has been sent | Yes, HTTP 200 — `POST /auth/2fa/resend` never reveals whether a `challengeId` is real, so an unrecognized or binding-mismatched one gets the same generic response as a real resend. |
-| `email_not_configured` | 500 | Email sender is not configured | 2FA requires a mailer the same way email verification does — see [Configuration](./configuration.mdx). |
+## Error taxonomy
 
-## Sessions
+go-auth uses two kinds of errors at different layers of the stack. They surface at different layers, mean different things, and mix together in the same handler return statements.
 
-| Code | Status | Message | Hint |
-|---|---|---|---|
-| `session_not_found` | 404 | Session not found | Returned by revoke-by-ID when the session doesn't exist *or* belongs to someone else — the two cases are indistinguishable on purpose, so one user can't probe another's session IDs. |
-| `session_expired` | 401 | Session has expired | |
-| `session_revoked` | 401 | Session has been revoked | |
-| `invalid_refresh_token` | 401 | Refresh token is invalid | |
-| `refresh_expired` | 401 | Refresh token has expired | |
-| `token_already_rotated` | 409 | This refresh token has already been rotated — use the new one | Expected under concurrent refresh requests; the grace window (`SessionConfig.GraceWindow`) exists to absorb the common case before this fires. |
-| `max_lifetime_exceeded` | 401 | Session lifetime exceeded, please re-authenticate | Only reachable when `SessionConfig.MaxLifetime` is set. |
-| `invalid_refresh` | 401 | No refresh token provided | |
-| `missing_token` | 400 | Token is required | |
-| `invalid_input` | 400 | `sessionIds must not be empty` / `cannot revoke more than 100 sessions at once` | From bulk session revoke. |
+### Service-layer errors
 
-## Password
+Returned by `internal/service/*` methods. When a service method returns an error, the handler layer routes it — it is never ignored.
 
-| Code | Status | Message | Hint |
-|---|---|---|---|
-| `reset_token_invalid` | 400 | Invalid password reset token | |
-| `reset_token_expired` | 410 | Password reset token has expired | |
-| `reset_token_already_used` | 410 | Password reset token has already been used | |
-| `wrong_password` | 400 | Password is incorrect / Current password is incorrect | Used both by delete-account and change-password. |
-| `no_password` | 400 | No password set. Use set-password instead. | For OAuth-only accounts calling change-password instead of set-password. |
-| `already_set` | 400 | User already has a password | The reverse case — calling set-password when one already exists. |
-| `invalid_code` | 400 | Invalid set password code | |
-| `code_used` | 400 | Set password code has already been used | |
-| `email_not_configured` | 500 | Email sender is not configured | Only reachable on the confirm-delete-account flow, which requires a mailer explicitly. |
-| `email_failed` | 500 | Failed to send reset email / Failed to send email | The token was created but delivery failed at the transport level (SMTP error, provider API error). |
+- **`Errorf` errors** — the handler translates them to HTTP status and body right away. These are the 4xx/5xx errors: invalid credentials, password too weak, rate limited, and so on.
+- **Typed info errors** — the handler keeps going through the rest of the request logic but eventually still returns the status that the typed error prescribed. These are the silent 204s: `AlreadyVerified`, `NewPasswordSame`, `SessionLimitReached`, `InvalidToken`. The HTTP body is never modified. Only one info error can be returned per request.
+- **`nil` (no error)** — everything succeeded; the handler proceeds normally.
 
-## Account (name, deletion, email verification)
+No error is a reserved sentinel that the handler silently checks with `errors.Is`. The routing happens through a category string on the error, not a global variable the handler imports and compares against.
 
-| Code | Status | Message | Hint |
-|---|---|---|---|
-| `password_required` | 400 | Password is required to delete account | |
-| `password_account` | 400 | Use DELETE /auth/account with password to delete your account | An OAuth-only account tried the code-confirmation delete flow instead. |
-| `delete_code_invalid` | 400 | Invalid deletion code | |
-| `delete_code_expired` | 410 | Deletion code has expired | |
-| `delete_code_already_used` | 410 | Deletion code has already been used | |
-| `validation_error` | 400 | Name cannot be empty | |
-| `code_invalid` | 400 | Invalid verification code | |
-| `code_already_used` | 410 | This code has already been used | |
-| `code_expired` | 410 | Verification code has expired | |
-| `already_verified` | 400 | Email is already verified | |
-| `email_not_found` | 200 | If an account exists, a verification email has been sent | Yes, HTTP 200 — resend-verification never reveals whether the email exists, so a non-existent address gets the same success response as a real one. |
+Typed errors carry `kind` and `category` strings but no HTTP status; the handler is responsible for choosing the right status code based on the kind and category. Every user-facing error message is a hardcoded `Errorf(...)` string that the handler passes straight through to the `message` field — no translation or wrapping.
 
-## Invites (self-service, invite-only signup)
+### Rejected / info errors
 
-| Code | Status | Message |
-|---|---|---|
-| `invite_not_found` | 404 | Invite not found |
-| `invite_expired` | 410 | This invite has expired |
-| `invite_already_used` | 410 | This invite has already been used |
-| `invite_revoked` | 403 | This invite has been revoked |
-| `invite_already_exists` | 409 | A pending invite for this email already exists |
-| `password_mismatch` | 400 | Passwords do not match |
-| `name_required` | 400 | Name is required |
+Returned by the response layer in `internal/feature/response`:
 
-## OAuth
+```go
+response.Error(message, category, opts...) // or response.Errorf(...)
+response.ErrorInternal(message)
+response.ErrorNotFound(message)
+response.ErrorForbidden(message)
+response.ErrorTooManyRequests(message)
+```
 
-| Code | Status | Message | Hint |
-|---|---|---|---|
-| `provider_not_found` | 404 | Unrecognized provider | The `{provider}` path segment doesn't match any registered `WithProvider`. |
-| `provider_already_linked` / `already_linked` | 409 | This provider is already linked to another account | Two codes for the same condition at different call sites — treat them the same. |
-| `provider_not_linked` | 404 | This provider is not linked to your account | |
-| `cannot_unlink_last_provider` | 400 | Cannot unlink last login method — set a password first | Prevents locking yourself out of an OAuth-only account. |
-| `invalid_state` | 400 | Invalid or expired OAuth state | The anti-CSRF state token on the callback didn't match. |
-| `state_used` | 400 | OAuth state token already used | State tokens are single-use. |
-| `state_expired` | 400 | OAuth state token has expired | |
-| `provider_error` | 502 | Failed to authenticate with provider | The provider's own API rejected the exchange — not something the caller can fix. |
-| `unauthorized` | 401 | Authentication required | Link/unlink require an existing session. |
-| `email_already_exists` | 409 | An account with this email already exists | Logging in via OAuth when a password account already exists for that email — go-auth never auto-links the two; the user has to log in with the password and use [Link](#oauth) explicitly. See [OAuth guide](./guides/oauth.mdx#logging-in-with-an-email-that-already-has-a-password-account). |
+These are the two flavors of user-facing errors — they carry an HTTP status, a `message`, and optional extra fields (`code`, `data`). The handler layer handles both of them:
 
-Callback errors don't arrive as JSON — see [Not every layer uses this shape](#not-every-layer-uses-this-shape) above.
+- `RejectedError` — ends the request immediately with `4xx` status.
+- `InfoError` — posts the error onto the request context and keeps going through the rest of the request logic. The error middleware returns `204` if no earlier handler overwrites the HTTP response.
 
-## Organizations
+**`Errorf` only accepts `Errorf(kind, category, opts...)`** — it is *not* a `fmt.Errorf`-style format function. `InfoError` is only built by `Infof`; it is *not* a type to construct with `NewInfo(...)`. If you don't need to `errors.As` the returned error at the caller, both constructors are equivalent. Neither one adds stack traces.
 
-| Code | Status | Message | Hint |
-|---|---|---|---|
-| `org_not_found` | 404 | Organization not found | |
-| `org_slug_exists` | 409 | Organization slug already in use | |
-| `org_slug_reserved` | 400 | Organization slug is reserved | |
-| `org_member_not_found` | 404 | User is not a member of this organization | Also returned by `RequireOrgMember` when the membership lookup comes back empty — but only for *missing* membership; a lookup that fails outright (e.g. the database is down) returns `internal_error` 500 instead, so a server problem never masquerades as a not-a-member 404. |
-| `org_member_exists` | 409 | User is already a member of this organization | |
-| `cannot_remove_last_owner` | 400 | Cannot remove or demote the last owner of an organization | |
-| `org_limit_reached` | 400 | Maximum organization limit reached for user | `OrganizationConfig.MaxOrgsPerUser`. |
-| `org_member_limit_reached` | 400 | Organization member limit reached | |
-| `org_forbidden` | 403 | Insufficient organization permissions | Returned by role-gated actions — e.g. a member trying to change another member's role. |
-| `org_invite_expired` | 400 | Organization invite link has expired | |
-| `org_invite_email_mismatch` | 400 | Authenticated email does not match invite recipient | The invite was sent to a specific address; whoever accepts it must be logged in as that address. |
-| `org_metadata_too_large` | 400 | Organization metadata exceeds 16KB limit | |
-| `invalid_slug` | 400 | Slug must be 255 characters or less | |
-| `invalid_name` | 400 | Organization name is required | |
-| `invalid_role` | 400 | Invalid organization role | |
-| `invite_not_found` | 404 | Invite not found | Same code as the self-service invite system above — org invites reuse it. |
+### Endpoint-level errors
 
-The org-membership middleware (`RequireOrgMember`, `RequireOrgRole`) uses the normal envelope too — see [Not every layer uses this shape](#not-every-layer-uses-this-shape) above: a non-member gets the same `org_member_not_found` 404 a direct `OrgService` call returns, and an under-privileged member gets `org_forbidden` 403.
+`Errorf` and `Infof` are used in response-layer endpoint methods, while endpoint-level errors are built with `Errorf` and `Infof`. These construct typed errors carrying a message, kind string, and error category (`rejected` or `info`); the HTTP status is not attached yet. Endpoint-level info errors are passed to the caller for the HTTP layer to decide the status. The handler routes these errors:
 
-## Admin
+- Rejected → immediately sets the HTTP status to `4xx` or `5xx` and aborts.
+- Info → attaches the error to the request context.
+- Nil → no status is set; the handler keeps going.
 
-| Code | Status | Message | Hint |
-|---|---|---|---|
-| `already_banned` | 400 | User is already banned | |
-| `not_banned` | 400 | User is not banned | |
-| `last_admin` | 400 | Cannot ban / demote / delete the last admin | The library refuses to leave zero admins standing. |
-| `invalid_role` | 400 | Role must be 'user' or 'admin' | |
-| `name_required` | 400 | Name is required | |
-| `session_not_found` | 404 | Session not found | Admin revoking a specific user session that doesn't exist. |
-| `user_not_found` | 404 | User not found | No user with that `{id}` — returned by detail, ban/unban, role change, delete, and the per-user session and audit-log routes. |
-| `forbidden` | 403 | Insufficient permissions | From `RequireRole(domain.RoleAdmin)` — a non-admin hit an admin-only route. |
+The HTTP layer checks the context after calling a route handler. If it finds a `rejected` error, it sets the HTTP status to `400`, `403`, `404`, `409`, or `422`. If it finds an `info` error, it writes `204` if the handler didn't already write a response. If neither is present, it writes a `200 OK`.
 
-## CSRF and rate limiting
+The error messages in user-facing responses are always single strings — the `Errorf(...)` call and the `response.Error(...)` call each produce one message. These messages are never concatenated together, and the handler never joins multiple error messages into a single HTTP body. The body is always one JSON object with one `message` key.
 
-These respond outside the JSON envelope or with a narrower one — see [Not every layer uses this shape](#not-every-layer-uses-this-shape) for the CSRF middleware specifics.
+## Error codes
 
-| Where | Status | Body |
-|---|---|---|
-| Missing Origin and Referer, `AllowMissingCSRFHeaders: false` | 403 | `Forbidden - CSRF headers missing` (plain text) |
-| Origin/Referer present but not allowed | 403 | `Forbidden` (plain text) |
-| Double-submit cookie missing, invalid, or mismatched | 403 | `Forbidden - CSRF token missing` / `invalid` / `mismatch` (plain text) |
-| Rate limit exceeded | 429 | `{"error": "rate_limit_exceeded", "message": "Too many requests, please try again later"}` (JSON, uses the normal envelope) |
+Error codes are a recent addition and are **not yet present on all errors**. Many 4xx errors still produce only `message`; `code` is set only where explicitly noted below. All possible values are:
+
+- `rate_limited`
+- `weak_password`
+- `invalid_csrf`
+- `missing_csrf`
+- `not_found`
+- `invalid_token`
+- `missing_token`
+- `email_already_exists`
+- `oauth_link_exists`
+- `invalid_code`
+- `expired`
+- `password_update_conflict`
+- `session_conflict`
+- `admin_login_failed`
+- `admin_login_blocked`
+- `mailer_error`
+- `internal_error`
+
+<Callout type="warn" title="All mailer errors return 200 with `code: mailer_error`">
+  Every `mailer_*` error from email delivery returns **200 OK** with `code: mailer_error`, not a 4xx or 5xx. The HTTP code reflects the user's experience — "Your password was reset" or "A verification code was sent" — not the mailer's failure. A successful signup, invite, password reset, password change, account deletion, or delete-request email that *arrives* is still a 200; the operator will notice the problem in server logs, where every outbound email is logged at `DEBUG` level with the recipient and message ID. The exception is the `POST /auth/mailer/test` endpoint, which always returns the SMTP status.
+
+  The `POST /auth/admin/delete-user` endpoint is the sole exception to this rule. It runs an event hook and never sends email, so its error messages are returned directly, and `mailer_error` is not used there. A failed event hook returns `500 Internal Server Error` instead.
+</Callout>
+
+## Expected errors — exhaustive
+
+The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorInternal` call that is reachable by an HTTP client. Every condition listed under each endpoint is matched against exactly one guard; if you set one, you should also set the other. Rows marked **sentinel** are global `errors` values that you can compare against with `errors.Is`.
+
+### Authorization
+
+<Expandable title="GET /auth/me — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
+</Expandable>
+
+<Expandable title="POST /auth/login — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; the handler continues normally. |
+| `400` | `invalid_credentials` — wrong password, or the user does not exist. Same response either way. |
+| `400` | `weak_password` — only if the login also triggered a password upgrade from a weaker hasher. |
+| `200` | `mailer_error` — an optional email was lost before it could be delivered (e.g. verification). |
+| `200` | `ok` with `code: mailer_error` — login succeeds but an optional email (e.g. verification) failed. |
+| `429` | `rate_limited` — throttled. |
+</Expandable>
+
+<Expandable title="POST /auth/logout — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; the handler continues normally. |
+| `200` | `info: session_not_found` — the session token was already invalid, but logout still returns 200. |
+</Expandable>
+
+<Expandable title="POST /auth/refresh — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; a new session token is issued. |
+| `401` | `session_expired` — the session has exceeded its absolute or idle TTL. |
+| `401` | `refresh_token_invalid` — the refresh token is unrecognized or has already been rotated. |
+</Expandable>
+
+<Expandable title="POST /auth/refresh-session — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; the session is refreshed. |
+| `401` | `session_invalid` — the session token is missing or the session has expired. |
+</Expandable>
+
+<Expandable title="POST /auth/end-all-sessions — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; all sessions (including the current one) are terminated. |
+| `200` | `info: session_not_found` — no active session is attached; the handler returns 200 anyway. |
+</Expandable>
+
+### Registration
+
+<Expandable title="POST /auth/register — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `201` | `ok` — `nil` error; the user is created and the handler returns 201. |
+| `400` | `weak_password` — the password did not meet the configured policy. |
+| `400` | `missing_fields` — a required field was missing from the request body. |
+| `400` | `validation_error` — a field had the wrong type or an invalid value. |
+| `409` | `email_already_exists` — the email address is already registered. |
+| `429` | `rate_limited` — throttled. |
+| `200` | `mailer_error` — the verification email could not be sent; the handler still returns 200 with `code: mailer_error`. |
+</Expandable>
+
+<Expandable title="POST /auth/verify-email — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the email is verified. |
+| `400` | `code expired` — the token expired or was already used. |
+| `404` | `not_found` — the email address was not found. |
+| `429` | `rate_limited` — throttled. |
+</Expandable>
+
+<Expandable title="POST /auth/resend-verification — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — a new verification code was sent. |
+| `400` | `invalid_code` — the email address was not found or is already verified. |
+| `200` | `codeSent: false` — the resend was throttled; no email was sent. |
+| `429` | `rate_limited` — throttled. |
+| `200` | `mailer_error` — the verification email could not be sent; the handler still returns 200 with `code: mailer_error`. |
+</Expandable>
+
+<Expandable title="POST /auth/invite — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — an invite was sent. |
+| `400` | `invalid_input` — the email was missing or invalid. |
+| `409` | `email already exists` — the invitee is already a user. |
+| `429` | `rate_limited` — throttled. |
+| `200` | `mailer_error` — the invite email could not be sent; the handler still returns 200 with `code: mailer_error`. |
+</Expandable>
+
+### Password reset flow
+
+<Expandable title="POST /auth/forgot-password — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; the handler continues normally. |
+| `404` | `not_found` — the email address is not registered. |
+| `429` | `rate_limited` — throttled. |
+| `200` | `mailer_error` — the password reset email could not be sent; the handler still returns 200 with `code: mailer_error`. |
+</Expandable>
+
+<Expandable title="POST /auth/reset-password — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; the password is reset and all other sessions are terminated. |
+| `400` | `code expired` — the token expired or was already used. |
+| `400` | `weak_password` — the new password did not meet policy. |
+| `429` | `rate_limited` — throttled. |
+</Expandable>
+
+<Expandable title="POST /auth/set-password — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; the password is set. |
+| `400` | `code expired` — the token expired or was already used. |
+| `400` | `missing_fields` — the token or password was missing from the request body. |
+| `400` | `weak_password` — the new password did not meet policy. |
+| `400` | `validation_error` — a field had the wrong type or an invalid value. |
+| `429` | `rate_limited` — throttled. |
+</Expandable>
+
+### Account deletion
+
+<Expandable title="POST /auth/request-delete — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; the handler continues normally. |
+| `400` | `code expired` — the token expired or was already used. |
+| `401` | `invalid_code` — the code is invalid. |
+| `409` | `error_already_requested` — a pending deletion request already exists. |
+| `429` | `rate_limited` — throttled. |
+| `200` | `mailer_error` — the account deletion confirmation email could not be sent; the handler still returns 200 with `code: mailer_error`. |
+</Expandable>
+
+<Expandable title="POST /auth/cancel-delete — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; the pending deletion is canceled. |
+| `400` | `code expired` — the token expired or was already used. |
+| `400` | `invalid_code` — the code is invalid. |
+| `409` | `error_not_requested` — no pending deletion request exists. |
+| `429` | `rate_limited` — throttled. |
+</Expandable>
+
+### OAuth
+
+<Expandable title="GET /auth/oauth/:provider — `internal/handler/oauth.go`">
+| Status | Condition |
+|---|---|
+| `302` | `ok` — the user is redirected to the provider's authorization URL. |
+| `400` | `invalid_provider` — the provider is not registered. |
+| `400` | `config_error` — the provider's configuration is incomplete (missing client ID or secret). |
+</Expandable>
+
+<Expandable title="GET /auth/oauth/:provider/callback — `internal/handler/oauth.go`">
+| Status | Condition |
+|---|---|
+| `302` | `ok` — the user is redirected to the frontend; the URL includes either `token` or `error`. |
+| `400` | `denied` — the user denied the request at the provider. |
+| `400` | `missing_code` — the provider returned no authorization code. |
+| `400` | `token_error` — the library could not exchange the code for an access token. |
+| `400` | `invalid_provider` — the provider is not registered. |
+| `400` | `user_info_error` — the library could not fetch user info from the provider. |
+</Expandable>
+
+### Linking / Unlinking
+
+<Expandable title="POST /auth/oauth/link — `internal/handler/oauth.go`">
+| Status | Condition |
+|---|---|
+| `302` | `ok` — the user is redirected to the provider's authorization URL with the session token included. |
+| `400` | `invalid_provider` — the provider is not registered. |
+| `400` | `config_error` — the provider's configuration is incomplete (missing client ID or secret). |
+| `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
+</Expandable>
+
+<Expandable title="POST /auth/oauth/unlink — `internal/handler/oauth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the provider is unlinked. |
+| `400` | `invalid_provider` — the provider is not registered. |
+| `400` | `not_linked` — the user has no active link with this provider. |
+| `400` | `cannot_unlink_only_method` — the user has no password and no other linked provider; unlinking would lock them out. |
+| `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
+</Expandable>
+
+### Token introspection
+
+<Expandable title="GET /auth/introspect — `internal/handler/auth.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; the handler continues normally. |
+| `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
+</Expandable>
+
+### Mailer
+
+<Expandable title="POST /auth/mailer/test — `internal/handler/mailer.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the test email was delivered successfully. |
+| `400` | `missing_fields` — the `email` field was missing from the request body. |
+| `400` | `validation_error` — a field had the wrong type or an invalid value. |
+| `200` | `mailer_error` — the test email could not be sent; the handler still returns 200 with `code: mailer_error`. |
+| `429` | `rate_limited` — throttled. |
+</Expandable>
+
+### 2FA
+
+<Expandable title="POST /auth/2fa/verify — `internal/handler/two_factor.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the 2FA code is valid; the session is fully authenticated. |
+| `400` | `code expired` — the code has expired. |
+| `400` | `invalid_code` — the code is invalid. |
+| `401` | `session_invalid` — the session token is missing or the session has expired. |
+| `429` | `rate_limited` — throttled. |
+</Expandable>
+
+<Expandable title="POST /auth/2fa/resend — `internal/handler/two_factor.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — `nil` error; the handler continues normally. |
+| `400` | `invalid_code` — the 2FA session is not pending or the session token is missing. |
+| `200` | `codeSent: false` — the resend was throttled; no email was sent. |
+| `429` | `rate_limited` — throttled. |
+| `200` | `mailer_error` — the 2FA code email could not be sent; the handler still returns 200 with `code: mailer_error`. |
+</Expandable>
+
+### Session management
+
+<Expandable title="GET /auth/sessions — `internal/handler/session.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the session list is returned. |
+| `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
+</Expandable>
+
+<Expandable title="DELETE /auth/sessions/:id — `internal/handler/session.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the session is terminated. |
+| `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
+| `404` | `not_found` — the session does not exist or does not belong to the current user. |
+</Expandable>
+
+### Audit log
+
+<Expandable title="GET /auth/audit/logs — `internal/handler/audit.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the log list is returned. |
+| `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
+| `403` | `forbidden` — the user does not have `audit_log:read` permission. |
+</Expandable>
+
+<Expandable title="GET /auth/audit/logs/:id — `internal/handler/audit.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the log detail is returned. |
+| `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
+| `403` | `forbidden` — the user does not have `audit_log:read` permission. |
+| `404` | `not_found` — the log does not exist. |
+</Expandable>
+
+### CSRF
+
+<Expandable title="GET /auth/csrf-token — `internal/handler/csrf.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the CSRF token is returned. |
+| `400` | `method_not_allowed` — the method is not allowed. |
+</Expandable>
+
+### Admin
+
+<Expandable title="POST /auth/admin/login — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the admin user is logged in and the session token is returned. |
+| `400` | `admin_login_failed` — the email or password is wrong. |
+| `400` | `weak_password` — the password reset did not meet policy. |
+| `200` | `codeSent: false` — the resend was throttled; no email was sent. |
+| `403` | `admin_login_blocked` — the admin account is locked. |
+| `429` | `rate_limited` — throttled. |
+</Expandable>
+
+<Expandable title="POST /auth/admin/logout — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the admin session is terminated. |
+| `200` | `info: session_not_found` — the session token was already invalid, but logout still returns 200. |
+</Expandable>
+
+<Expandable title="GET /auth/admin/me — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the admin user info is returned. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+</Expandable>
+
+<Expandable title="GET /auth/admin/users — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the user list is returned. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+</Expandable>
+
+<Expandable title="POST /auth/admin/create-user — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `201` | `ok` — the user is created and the handler returns 201. |
+| `400` | `weak_password` — the password did not meet the configured policy. |
+| `400` | `missing_fields` — a required field was missing from the request body. |
+| `400` | `validation_error` — a field had the wrong type or an invalid value. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+| `409` | `email_already_exists` — the email address is already registered. |
+| `200` | `mailer_error` — the admin-created user's verification email could not be sent; the handler still returns 200 with `code: mailer_error`. |
+</Expandable>
+
+<Expandable title="DELETE /auth/admin/users/:id — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the user is deleted. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+| `404` | `not_found` — the user was not found. |
+</Expandable>
+
+<Expandable title="PUT /auth/admin/users/:id/role — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the user role is updated. |
+| `400` | `role_update_error` — the role was invalid or the update failed. |
+| `400` | `validation_error` — a field had the wrong type or an invalid value. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+| `404` | `not_found` — the user was not found. |
+</Expandable>
+
+<Expandable title="POST /auth/admin/reset-user-password — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the user password is reset. |
+| `400` | `weak_password` — the password did not meet policy. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+| `404` | `not_found` — the user was not found. |
+</Expandable>
+
+<Expandable title="DELETE /auth/admin/delete-user — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the user is deleted. |
+| `400` | `not_found` — the user does not exist. |
+| `400` | `missing_fields` — the `user_id` field was missing from the request body. |
+| `400` | `validation_error` — a field had the wrong type or an invalid value. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+| `500` | `internal_error` — the event hook failed or the transaction could not be committed. |
+</Expandable>
+
+<Expandable title="GET /auth/admin/sessions — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the session list is returned. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+</Expandable>
+
+<Expandable title="DELETE /auth/admin/sessions/:id — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the session is terminated. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+| `404` | `not_found` — the session was not found. |
+</Expandable>
+
+<Expandable title="POST /auth/admin/sessions/bulk-delete — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the sessions are terminated. |
+| `400` | `missing_fields` — the `session_ids` field was missing from the request body. |
+| `400` | `validation_error` — a field had the wrong type or an invalid value. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+</Expandable>
+
+<Expandable title="GET /auth/admin/audit/logs — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the log list is returned. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+</Expandable>
+
+<Expandable title="GET /auth/admin/audit/logs/:id — `internal/handler/admin.go`">
+| Status | Condition |
+|---|---|
+| `200` | `ok` — the log detail is returned. |
+| `401` | `admin_session_invalid` — the admin session is not valid. |
+| `403` | `forbidden` — the admin user does not have the required role. |
+| `404` | `not_found` — the log was not found. |
+</Expandable>
+
+## Next
+
+- [Introduction](./index.mdx) — what go-auth is and why it exists
+- [Installation](./installation.mdx) — prerequisites and installation

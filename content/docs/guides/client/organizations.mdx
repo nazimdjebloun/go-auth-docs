@@ -1,165 +1,107 @@
 ---
-title: "Organizations"
-description: "orgApi — a named-method wrapper around org CRUD, membership, active-org, and invites, built on the apiRequest helper."
-icon: "Blocks"
+title: "Organization Client"
+description: "Organization management from the client."
+icon: "Building2"
 ---
 
-# Organizations client
+# Organization Client
 
-Wraps every endpoint from the [Organizations](../organizations.mdx) guide into `orgApi`, built on the [`apiRequest`](./index.mdx) helper.
+This guide covers how to manage organizations from a frontend or mobile client.
 
-```ts
-import { apiRequest } from "./client";
+## Listing organizations
 
-const API_BASE = "https://api.myapp.com";
+Get all organizations the current user belongs to:
 
-export const orgApi = {
-  create: (input: { name: string; slug: string }) =>
-    apiRequest(API_BASE, "POST", "/auth/orgs", input),
+```javascript
+const response = await fetch('/auth/org', {
+  credentials: 'include'
+});
 
-  // limit is `number | undefined`, checked with `!== undefined` below rather
-  // than truthiness — `limit: 0` is the explicit "unlimited" signal the
-  // service supports, and a truthy check would silently drop it since 0 is
-  // falsy. Omitting `limit` entirely gets the default page of 20 server-side.
-  listMine: (params: {
-    search?: string;
-    orderBy?: "name" | "created_at" | "member_count";
-    orderDirection?: "asc" | "desc";
-    limit?: number;
-    offset?: number;
-  } = {}) => {
-    const query = new URLSearchParams();
-    if (params.search) query.set("search", params.search);
-    if (params.orderBy) query.set("orderBy", params.orderBy);
-    if (params.orderDirection) query.set("orderDirection", params.orderDirection);
-    if (params.limit !== undefined) query.set("limit", String(params.limit));
-    if (params.offset) query.set("offset", String(params.offset));
-    const qs = query.toString();
-    return apiRequest(API_BASE, "GET", `/auth/orgs${qs ? `?${qs}` : ""}`);
-  },
-
-  // List responses carry no `total`. Each list has a matching `/count` that
-  // takes the filter params only — call it on its own cadence for the pager.
-  countMine: (search?: string) =>
-    apiRequest(API_BASE, "GET", `/auth/orgs/count${search ? `?search=${encodeURIComponent(search)}` : ""}`),
-
-  get: (orgId: string) => apiRequest(API_BASE, "GET", `/auth/orgs/${orgId}`),
-
-  update: (orgId: string, input: { name?: string; slug?: string }) =>
-    apiRequest(API_BASE, "PUT", `/auth/orgs/${orgId}`, input),
-
-  delete: (orgId: string) => apiRequest(API_BASE, "DELETE", `/auth/orgs/${orgId}`),
-
-  listMembers: (orgId: string, params: {
-    role?: "owner" | "admin" | "member";
-    search?: string;
-    orderBy?: "joined_at" | "role" | "name" | "email";
-    orderDirection?: "asc" | "desc";
-    limit?: number;
-    offset?: number;
-  } = {}) => {
-    const query = new URLSearchParams();
-    if (params.role) query.set("role", params.role);
-    if (params.search) query.set("search", params.search);
-    if (params.orderBy) query.set("orderBy", params.orderBy);
-    if (params.orderDirection) query.set("orderDirection", params.orderDirection);
-    if (params.limit !== undefined) query.set("limit", String(params.limit));
-    if (params.offset) query.set("offset", String(params.offset));
-    const qs = query.toString();
-    return apiRequest(API_BASE, "GET", `/auth/orgs/${orgId}/members${qs ? `?${qs}` : ""}`);
-  },
-
-  countMembers: (orgId: string, params: { role?: "owner" | "admin" | "member"; search?: string } = {}) => {
-    const query = new URLSearchParams();
-    if (params.role) query.set("role", params.role);
-    if (params.search) query.set("search", params.search);
-    const qs = query.toString();
-    return apiRequest(API_BASE, "GET", `/auth/orgs/${orgId}/members/count${qs ? `?${qs}` : ""}`);
-  },
-
-  removeMember: (orgId: string, userId: string) =>
-    apiRequest(API_BASE, "DELETE", `/auth/orgs/${orgId}/members/${userId}`),
-
-  updateMemberRole: (orgId: string, userId: string, role: "owner" | "admin" | "member") =>
-    apiRequest(API_BASE, "PATCH", `/auth/orgs/${orgId}/members/${userId}/role`, { role }),
-
-  leave: (orgId: string) => apiRequest(API_BASE, "POST", `/auth/orgs/${orgId}/leave`),
-
-  setActive: (orgId: string) => apiRequest(API_BASE, "PUT", "/auth/orgs/active", { orgId }),
-
-  clearActive: () => apiRequest(API_BASE, "DELETE", "/auth/orgs/active"),
-
-  createInvite: (orgId: string, input: { email: string; role: "owner" | "admin" | "member" }) =>
-    apiRequest(API_BASE, "POST", `/auth/orgs/${orgId}/invites`, input),
-
-  acceptInvite: (code: string) =>
-    apiRequest(API_BASE, "POST", "/auth/orgs/invites/accept", { code }),
-
-  listInvites: (orgId: string, params: {
-    role?: "owner" | "admin" | "member";
-    status?: "pending" | "expired";
-    search?: string;
-    orderBy?: "created_at" | "expires_at" | "email" | "role";
-    orderDirection?: "asc" | "desc";
-    limit?: number;
-    offset?: number;
-  } = {}) => {
-    const query = new URLSearchParams();
-    if (params.role) query.set("role", params.role);
-    if (params.status) query.set("status", params.status);
-    if (params.search) query.set("search", params.search);
-    if (params.orderBy) query.set("orderBy", params.orderBy);
-    if (params.orderDirection) query.set("orderDirection", params.orderDirection);
-    if (params.limit !== undefined) query.set("limit", String(params.limit));
-    if (params.offset) query.set("offset", String(params.offset));
-    const qs = query.toString();
-    return apiRequest(API_BASE, "GET", `/auth/orgs/${orgId}/invites${qs ? `?${qs}` : ""}`);
-  },
-
-  countInvites: (orgId: string, params: {
-    role?: "owner" | "admin" | "member";
-    status?: "pending" | "expired";
-    search?: string;
-  } = {}) => {
-    const query = new URLSearchParams();
-    if (params.role) query.set("role", params.role);
-    if (params.status) query.set("status", params.status);
-    if (params.search) query.set("search", params.search);
-    const qs = query.toString();
-    return apiRequest(API_BASE, "GET", `/auth/orgs/${orgId}/invites/count${qs ? `?${qs}` : ""}`);
-  },
-
-  resendInvite: (orgId: string, inviteId: string) =>
-    apiRequest(API_BASE, "POST", `/auth/orgs/${orgId}/invites/${inviteId}/resend`),
-
-  deleteInvite: (orgId: string, inviteId: string) =>
-    apiRequest(API_BASE, "DELETE", `/auth/orgs/${orgId}/invites/${inviteId}`),
-};
+const data = await response.json();
+data.organizations.forEach(org => {
+  console.log(org.name, org.role);
+});
 ```
 
-## Using it
+## Creating an organization
 
-```ts
-const org = await orgApi.create({ name: "Acme Inc", slug: "acme" });
-await orgApi.setActive(org.id);
+Create a new organization:
+
+```javascript
+const response = await fetch('/auth/org', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    name: 'My Organization',
+    slug: 'my-org'
+  }),
+  credentials: 'include'
+});
+
+const data = await response.json();
+// data.organization contains the new organization
 ```
 
-```ts
-const { members } = await orgApi.listMembers(orgId);
-const { count } = await orgApi.countMembers(orgId); // total for the pager
-await orgApi.updateMemberRole(orgId, userId, "admin");
+## Inviting members
+
+Invite a user to an organization:
+
+```javascript
+await fetch('/auth/org/${orgId}/invite', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    email: 'invitee@example.com',
+    role: 'member'
+  }),
+  credentials: 'include'
+});
 ```
 
-```ts
-try {
-  await orgApi.acceptInvite(code);
-} catch (err) {
-  // org_invite_expired / org_invite_email_mismatch — see the Organizations guide
-  showError(err.message ?? err.error);
-}
+## Accepting invitations
+
+Accept an organization invitation:
+
+```javascript
+await fetch('/auth/org/accept-invite', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ token: 'invite-token' }),
+  credentials: 'include'
+});
+```
+
+## Managing members
+
+List members:
+
+```javascript
+const response = await fetch(`/auth/org/${orgId}/members`, {
+  credentials: 'include'
+});
+```
+
+Change a member's role:
+
+```javascript
+await fetch(`/auth/org/${orgId}/members/${userId}/role`, {
+  method: 'PUT',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ role: 'admin' }),
+  credentials: 'include'
+});
+```
+
+Remove a member:
+
+```javascript
+await fetch(`/auth/org/${orgId}/members/${userId}`, {
+  method: 'DELETE',
+  credentials: 'include'
+});
 ```
 
 ## Next
 
-- [Setup](./index.mdx) — the `apiRequest` helper this is built on
-- [Organizations](../organizations.mdx) — full request/response/error reference, roles, and the Owner-escalation rule
+- [Organizations guide](../organizations.mdx) — setup and configuration
+- [Client integration](./index.mdx) — overview

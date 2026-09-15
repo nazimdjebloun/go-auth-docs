@@ -1,6 +1,6 @@
 ---
 title: "Installation"
-description: "Prerequisites, what you need before configuring go-auth, and a map of the configuration pattern."
+description: "Prerequisites, supported databases, and installing the library and its dependencies."
 icon: "Download"
 ---
 
@@ -8,102 +8,54 @@ icon: "Download"
 
 ## Prerequisites
 
-- Go 1.26 or later
-- A database: PostgreSQL, MySQL, or SQLite
-- An SMTP server, or your own mailer implementation — required unless every email-sending feature is off (invites, email verification, 2FA, and admin login's two-factor challenge, the last of which is on by default and needs `SecurityConfig.DisableAdminTwoFactor` to turn off). `EnvironmentDev` is the one exception when a mailer is otherwise needed: with neither `WithMailer` nor `WithEmail` set, it falls back to a log-only driver. See [Configuration](./configuration.mdx#withmailer--withemail--withtemplates--required-unless-every-email-feature-is-off).
+- **Go 1.22** or later (see `go.mod` in the source repo).
+- A supported database: **SQLite** (via `modernc.org/sqlite` — no CGo required) or **PostgreSQL** (via `github.com/jackc/pgx/v5`).
 
-## Install
+## Supported databases
 
-```bash
-go get github.com/nazimdjebloun/go-auth
-```
+go-auth officially supports:
 
-go-auth's own `go.mod` requires `pgx/v5` (PostgreSQL) and `modernc.org/sqlite` (SQLite) directly, plus the libraries it uses. The library imports the pgx stdlib driver itself, so Postgres registers out of the box. For the driver you actually use, your program needs to blank-import that driver's package so it registers itself with `database/sql`:
+- **SQLite** — via `modernc.org/sqlite`, the pure-Go SQLite driver. No CGo required.
+- **PostgreSQL** — via `github.com/jackc/pgx/v5`. The recommended driver for production.
 
-| Database | Package |
-|---|---|
-| PostgreSQL | `github.com/jackc/pgx/v5/stdlib` |
-| SQLite | `modernc.org/sqlite` (pure Go, no CGO) |
-| MySQL | `github.com/go-sql-driver/mysql` |
+Other databases may work via custom `Port` implementations but are not officially supported.
 
-If the driver you configured isn't actually registered (the import is missing), `New()` fails fast at startup with a clear error naming the missing import — it doesn't fail later on the first query.
-
-## The `goauth` CLI
-
-Schema and bootstrap tooling, shipped alongside the library. There are two ways to run it, and they do the same thing:
+## Getting go-auth
 
 ```bash
-# Install once, then call it by name
-go install github.com/nazimdjebloun/go-auth/cmd/goauth@latest
-goauth migrate --driver postgres --dsn "$DATABASE_URL"
-
-# Or run it without installing anything
-go run github.com/nazimdjebloun/go-auth/cmd/goauth@latest migrate \
-  --driver postgres --dsn "$DATABASE_URL"
+go get github.com/nazimdjebloun/go-auth@latest
 ```
 
-`go install` is shorter to type afterwards and faster on repeat use, but it needs `$GOBIN` (or `$GOPATH/bin`) on your `PATH`, and it pins whatever version you installed until you reinstall. `go run` leaves nothing behind and is always current — the better fit for CI, a Dockerfile, or a one-off bootstrap, which is how `migrate` and `seed-admin` are usually used.
+Use standard `go get` — no special install step is needed.
 
-<Callout type="warn" title="`@latest` is required, in both forms">
-  `cmd/goauth` is a **separate module** with its own `go.mod`, so it isn't part of your project's dependency graph even after `go get` of the library. Drop the version suffix and Go looks for the package among your own dependencies and fails with `no required module provides package`. This is not a `run` vs `install` distinction — both need it. Pin a release instead of `@latest` if you want reproducible builds.
-</Callout>
+## Optional: CLI for local development
 
-| Command | What it does |
-|---|---|
-| `migrate` | Connects to your database and applies the schema directly, one statement at a time. Requires `--driver` and `--dsn`. |
-| `generate` | Writes the schema to a `.sql` file instead of applying it — for checking in, or feeding to Atlas, golang-migrate, Flyway, or your own migration tool. Requires `--driver`; `--out` defaults to `auth.schema.sql`. |
-| `seed-admin` | Creates the first admin account directly in the database, since every admin route needs an existing admin session to call. Sends a real email first and writes nothing if that send fails. See [Admin → Creating the first admin](./guides/admin.mdx#creating-the-first-admin). |
-
-Each command takes `--help`. [Schemas](./schemas.mdx) covers `migrate` and `generate` in full.
-
-## What you'll need before configuring
-
-Gather these before writing your configuration:
-
-- **A base URL** for your frontend — used to build links in emails (verification, invites, password reset).
-- **A database connection** — either a connection string, or a database/pool you've already opened yourself.
-- **A signing secret** — at least 32 random bytes. This is the one piece of key material the library needs; source it from your environment, never commit it.
-- **The origins your frontend is served from** — used for CSRF origin checking. There's no wildcard option by design.
-- **A mailer, conditionally** — required if you enable invite-only signup, email verification, or 2FA, or leave admin login's two-factor challenge on (the default — turn it off with `SecurityConfig.DisableAdminTwoFactor` for a mailer-free, API-only deployment). Either SMTP credentials or your own delivery implementation (Resend, Postmark, SES, etc.) work. `EnvironmentDev` alone falls back to a log-only driver when a mailer is needed but neither is configured.
-- **OAuth credentials, conditionally** — a client ID, client secret, and redirect URL per provider, only if you want OAuth login.
-
-Nothing here is read from the environment by the library itself — go-auth has no notion of env vars. You decide how your program sources these values (environment variables are the usual choice) and pass them in as plain Go values.
-
-## The configuration pattern, at a glance
-
-Every aspect of the library is configured through its own option function, and all of them are passed to a single call: `NewConfig(opts ...Option)`. The next page covers each one field by field — this is just the map:
-
-| Option | Configures |
-|---|---|
-| `WithApp` | App name, base URL, database connection, deployment environment |
-| `WithSecret` | The signing secret |
-| `WithSecurity` | Allowed origins, password policy, CSRF token, token TTL |
-| `WithSession` | Session and refresh token lifetimes |
-| `WithCookie` | Cookie name, domain, path, `SameSite`, `Secure` |
-| `WithRegistration` | Which signup methods are available |
-| `WithOrganizations` | Multi-tenant organizations |
-| `WithMailer` | A custom mailer implementation |
-| `WithEmail` | The built-in SMTP mailer |
-| `WithTemplates` | Custom email templates |
-| `WithRateLimit` and its narrower variants | Per-route rate limiting |
-| `WithProvider` | Register an OAuth provider |
-| `WithLogger` | Structured logging |
-| `WithAudit` / `WithAuditSink` | Audit logging |
-
-## Database setup
-
-The schema ships embedded in the library — there is no `.sql` file to find on
-disk after `go get`. Apply it once before starting your app for the first time:
+The `cmd/goauth` CLI is optional. It scaffolds a local database with realistic test data for development — it starts no servers.
 
 ```bash
-go run github.com/nazimdjebloun/go-auth/cmd/goauth@latest migrate \
-  --driver postgres --dsn "$DATABASE_URL"
+go run github.com/nazimdjebloun/go-auth/cmd/goauth@latest --help
 ```
 
-[Schemas](./schemas.mdx) covers the tables themselves, the other two ways to get
-at the schema, and what to expect when it changes between releases.
+```bash
+# Initialize a new database with default settings
+go run github.com/nazimdjebloun/go-auth/cmd/goauth init
+
+# Create a new admin user
+go run github.com/nazimdjebloun/go-auth/cmd/goauth admin --email admin@example.com
+```
+
+For the full configuration reference, see [Configuration](./configuration.mdx).
+
+## What this guide does not cover
+
+This guide assumes a single-developer or proof-of-concept setup. For production deployment, you'll also need:
+
+- **HTTPS termination** — reverse proxy (nginx, Caddy, Traefik) or cloud load balancer.
+- **Secure cookie handling** — already handled by go-auth when `BaseURL` is `https://` (Secure is `true` by default).
+- **CORS middleware** — if your frontend is on a different domain.
+- **Logging middleware** — go-auth uses `slog`; integrate with your existing logger.
+- **Rate limiting middleware** — go-auth includes built-in rate limiting for auth routes. See [Configuration](./configuration.mdx#withratelimit-and-its-narrower-variants--optional-on-by-default).
 
 ## Next
 
-- [Configuration](./configuration.mdx) — every option, field by field
-- [Schemas](./schemas.mdx) — the tables, the CLI, and applying the schema
+- [Configuration](./configuration.mdx) — every configuration option, field by field

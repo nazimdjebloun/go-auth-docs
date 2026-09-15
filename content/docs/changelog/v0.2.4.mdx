@@ -1,0 +1,59 @@
+---
+title: "v0.2.4"
+description: "Versioned password hashing with lazy rehash, HMAC-peppered OTP codes with rotation-aware expiry, tenant-scoped organization handlers, hardened credential flows, and a fully reworked CI pipeline."
+date: "2026-09-15"
+---
+
+## Password hashing and pepper
+
+- **Versioned password hashing with lazy rehash migration.** `WithPasswordPepper` enables an optional versioned HMAC layer before bcrypt or Argon2id. Each version's key is derived with HKDF (`goauth-password-pepper-v1`), and `users.password_pepper_version` selects exactly one key during verification — no trial loop. Existing `NULL` rows verify unpeppered and upgrade to the current version through a guarded rehash-on-login path. Rotation uses monotonically increasing versions with a compare-and-swap guarded by the previously read hash and pepper version; a lost race returns `password_update_conflict` for change/reset and is a harmless skipped best-effort rehash for login. `New()` validates that every stored version has a corresponding key at startup, sharing a 10-second deadline with the database ping.
+
+- **HMAC-peppered OTP codes with rotation-aware expiry.** Low-entropy codes (2FA, verification, set-password, delete-account) are now HMAC'd under a pepper derived from `WithSecret` (`goauth-otp-pepper-v1`), so a leaked database doesn't hand over offline guessing material. Pairing `WithSecret` rotation with `WithPepperRotatedAt` makes pre-rotation codes fail as `expired` / `code_expired` instead of `invalid_code` — the client's resend branch — without burning per-challenge attempt budget. Resending always mints under the live pepper, so one resend recovers. Unset (the zero default) disables this branch: verification is purely by HMAC.
+
+## Security hardening
+
+- **Close atomicity and race windows across credential flows.** Password reset is now one database transaction after the intentionally out-of-transaction KDF work: it atomically claims the exact token while its ID, hash, user, type, expiry, and unused state still match; applies the password hash/version compare-and-swap; and deletes every session for that user. Change-password, invite redemption, OAuth registration, provider unlinking, and organization membership removal/role changes all use the same guarded transaction boundary. Audit publication occurs only after commit.
+
+- **Harden token and session failure paths.** `middleware.RemoteAuth` and several token-validation paths now fail closed on unexpected conditions rather than silently passing.
+
+- **Fail closed on non-positive CSRF token length.** `middleware.CSRFToken` now rejects a `TokenLength` of zero or negative values at startup rather than producing an unusable token.
+
+## Features
+
+- **Tenant-scoped organization handlers.** `RequireOrgScope` and `RequireActiveOrgScope` on the root `Auth` facade compose authentication, org membership, and role checks, then pass an authorized `OrgScope` directly to application handlers — so the authorized `org_id` is a required handler argument, not something the handler has to recover from context. `RequireActiveOrgScope` reads the active org from the session; `RequireOrgScope` reads it from an `{orgID}` path segment.
+
+- **Validate OAuth provider credentials at startup.** `New()` now checks that every registered provider's client ID and secret are non-empty, failing fast with a clear error instead of discovering the misconfiguration on the first login attempt.
+
+## Fixes
+
+- **Roll back `WithTx` on panic.** A panic escaping the transaction function now rolls back via a deferred rollback before propagating, so it can never pin the connection.
+
+- **Default verification resend throttle to 60s.** `VerificationResendInterval` now defaults to 60 seconds when left at zero, closing a gap where the zero value meant no minimum interval.
+
+- **Route handler responses through the configured logger.** Handler-level errors are now logged through the `*slog.Logger` you pass to `WithLogger`, not the default logger.
+
+- **Lower bcrypt cost in integration tests** to speed up CI suites.
+
+## Refactoring
+
+- **Export `Config`, keeping every field unexported.** The root `config` type is now `goauth.Config` — a public type you can pass around but not construct directly. Every field remains unexported; `NewConfig(opts ...Option)` is still the only way to build one.
+
+- **Move `service` under `internal/`, alias its public types in root.** Service-layer types (`LoginInput`, `RegisterInput`, ...) are re-exported from the root `goauth` package, so external callers see no change in import paths.
+
+- **Split `auth.go` into five files** (`auth.go`, `wire.go`, `options.go`, `middleware.go`, `config.go`) along the responsibilities they already carried.
+
+- **Split `config.go` along its section dividers.** Each configuration section (`WithApp`, `WithSecret`, `WithSecurity`, ...) now lives in its own file, matching the documentation's structure.
+
+- **Split `service/admin.go` into six files by concern** and **split `internal/handler/admin.go` into six files by concern**, each mirroring the domain area it serves.
+
+- **Split `internal/testutil/mocks.go` into one file per mocked port**, making it clear which mock serves which interface.
+
+## Testing
+
+- **Fuzz targets across parsers, crypto, and validation.** New fuzz targets for OTP generation, schema parsing, token generation, and several internal parsers exercise edge cases that table-driven tests miss.
+
+## Documentation
+
+- Document the atomicity guarantees across password reset, change-password, invite redemption, OAuth callback, provider unlinking, and organization membership operations.
+- Clarify audit failure-mode semantics: `FailureMode` governs sink behavior after a flush error, not whether the triggering HTTP request succeeds.
+- Correct and tighten reference documentation across configuration, error handling, and security guides.

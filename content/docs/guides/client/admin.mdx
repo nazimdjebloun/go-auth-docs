@@ -1,153 +1,64 @@
 ---
-title: "Admin"
-description: "adminApi — user management, audit-log queries, and platform invites for an admin dashboard, built on the apiRequest helper."
-icon: "UserCog"
+title: "Admin Client"
+description: "Admin client integration for user and session management."
+icon: "ShieldCheck"
 ---
 
-# Admin client
+# Admin Client
 
-Wraps every endpoint from the [Admin](../admin.mdx) and [Audit Logs](../audit-logs.mdx) guides into `adminApi`, built on the [`apiRequest`](./index.mdx) helper. Every call here 403s unless the logged-in user has `role: "admin"` — this is for an admin dashboard, not a regular app surface.
+The admin client integration follows the same patterns as the user client, but uses separate admin sessions and routes.
 
-```ts
-import { apiRequest } from "./client";
+## Admin login
 
-const API_BASE = "https://api.myapp.com";
+Admin login uses `POST /auth/admin/login` with a separate session scope:
 
-export const adminApi = {
-  login: (email: string, password: string) =>
-    apiRequest(API_BASE, "POST", "/auth/admin/login", { email, password }),
+```javascript
+const response = await fetch('/auth/admin/login', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ email: 'admin@example.com', password: 'password' }),
+  credentials: 'include'
+});
 
-  listUsers: (params: Record<string, string | number> = {}) =>
-    apiRequest(API_BASE, "GET", `/admin/users?${new URLSearchParams(params as Record<string, string>)}`),
-
-  // The list response has no `total`. Fetch the count separately, keyed on
-  // the filter params only (drop offset/limit) so paging doesn't re-run it.
-  countUsers: (params: Record<string, string | number> = {}) =>
-    apiRequest(API_BASE, "GET", `/admin/users/count?${new URLSearchParams(params as Record<string, string>)}`),
-
-  getUser: (userId: string) => apiRequest(API_BASE, "GET", `/admin/users/${userId}`),
-
-  createUser: (input: { email: string; password: string; name: string; role?: "user" | "admin" }) =>
-    apiRequest(API_BASE, "POST", "/admin/users", input),
-
-  updateRole: (userId: string, role: "user" | "admin") =>
-    apiRequest(API_BASE, "PATCH", `/admin/users/${userId}/role`, { role }),
-
-  ban: (userId: string) => apiRequest(API_BASE, "PATCH", `/admin/users/${userId}/ban`),
-
-  unban: (userId: string) => apiRequest(API_BASE, "PATCH", `/admin/users/${userId}/unban`),
-
-  deleteUser: (userId: string) => apiRequest(API_BASE, "DELETE", `/admin/users/${userId}`),
-
-  listUserSessions: (userId: string, offset = 0, limit = 20) =>
-    apiRequest(API_BASE, "GET", `/admin/users/${userId}/sessions?offset=${offset}&limit=${limit}`),
-
-  revokeUserSession: (userId: string, sessionId: string) =>
-    apiRequest(API_BASE, "DELETE", `/admin/users/${userId}/sessions/${sessionId}`),
-
-  revokeUserSessions: (userId: string) =>
-    apiRequest(API_BASE, "DELETE", `/admin/users/${userId}/sessions`),
-
-  // --- Stats and activity ---
-
-  getStats: () => apiRequest(API_BASE, "GET", "/admin/stats"),
-
-  getRegistrationTrend: (from: string, to: string) =>
-    apiRequest(API_BASE, "GET", `/admin/stats/registrations?from=${from}&to=${to}`),
-
-  getLoginActivity: (from: string, to: string, userId?: string) =>
-    apiRequest(
-      API_BASE, "GET",
-      `/admin/stats/logins?from=${from}&to=${to}${userId ? `&userId=${userId}` : ""}`
-    ),
-
-  // --- Audit logs — requires WithAudit(AuditConfig{Enabled: true}) server-side ---
-
-  listAuditLogs: (params: Record<string, string | number> = {}) =>
-    apiRequest(API_BASE, "GET", `/admin/audit-logs?${new URLSearchParams(params as Record<string, string>)}`),
-
-  countAuditLogs: (params: Record<string, string | number> = {}) =>
-    apiRequest(API_BASE, "GET", `/admin/audit-logs/count?${new URLSearchParams(params as Record<string, string>)}`),
-
-  listUserAuditLogs: (userId: string, params: Record<string, string | number> = {}) =>
-    apiRequest(API_BASE, "GET", `/admin/users/${userId}/audit-logs?${new URLSearchParams(params as Record<string, string>)}`),
-
-  countUserAuditLogs: (userId: string, params: Record<string, string | number> = {}) =>
-    apiRequest(API_BASE, "GET", `/admin/users/${userId}/audit-logs/count?${new URLSearchParams(params as Record<string, string>)}`),
-
-  // --- Platform invites — requires RegistrationConfig.EnableInvite ---
-
-  createInvite: (email: string) => apiRequest(API_BASE, "POST", "/admin/invites", { email }),
-
-  listInvites: (params: Record<string, string | number> = {}) =>
-    apiRequest(API_BASE, "GET", `/admin/invites?${new URLSearchParams(params as Record<string, string>)}`),
-
-  countInvites: (params: Record<string, string | number> = {}) =>
-    apiRequest(API_BASE, "GET", `/admin/invites/count?${new URLSearchParams(params as Record<string, string>)}`),
-
-  revokeInvite: (inviteId: string) => apiRequest(API_BASE, "DELETE", `/admin/invites/${inviteId}`),
-
-  resendInvite: (inviteId: string) => apiRequest(API_BASE, "POST", `/admin/invites/${inviteId}/resend`),
-
-  deleteInvite: (inviteId: string) => apiRequest(API_BASE, "DELETE", `/admin/invites/${inviteId}/hard`),
-};
-```
-
-## Using it
-
-```ts
-const { users } = await adminApi.listUsers({ limit: 20, search: "ada" });
-const { count } = await adminApi.countUsers({ search: "ada" }); // total for the pager
-```
-
-```ts
-try {
-  await adminApi.updateRole(userId, "user");
-} catch (err) {
-  // last_admin — see the Admin guide
-  showError(err.message ?? err.error);
+const data = await response.json();
+if (data.pending_2fa) {
+  // Admin 2FA verification required
+} else {
+  // Admin login successful
 }
 ```
 
-## Stats and activity
+## Admin session cookie
 
-```ts
-const stats = await adminApi.getStats();
-const { registrations } = await adminApi.getRegistrationTrend("2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
-const { logins } = await adminApi.getLoginActivity("2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z"); // global
-const { logins: userLogins } = await adminApi.getLoginActivity(from, to, userId); // one user's heatmap
+Admin sessions use a separate cookie (`_admin_session`). Include it in subsequent admin requests:
+
+```javascript
+// List all users
+const response = await fetch('/auth/admin/users', {
+  credentials: 'include'
+});
+const users = await response.json();
 ```
 
-## Audit logs
+## Admin routes
 
-```ts
-const { events } = await adminApi.listAuditLogs({ event_type: "login.failed", limit: 50 });
-const { count } = await adminApi.countAuditLogs({ event_type: "login.failed" });
+All admin routes require an admin session and appropriate permissions:
 
-// event_type takes a comma-separated list — matches any of them
-const failures = await adminApi.listAuditLogs({ event_type: "login.failed,login.locked" });
-
-// actorEmail/targetEmail resolve to a user ID server-side — no need to
-// already know the UUID. 404 user_not_found if no user has that email.
-const byActor = await adminApi.listAuditLogs({ actorEmail: "ada@example.com" });
-
-// deviceType filters on the parsed user agent: mobile, desktop, tablet, bot
-const mobileLogins = await adminApi.listAuditLogs({ event_type: "login.success", deviceType: "mobile" });
-```
-
-`listAuditLogs()` with no filters returns everything in the audit log, paginated — it's never a 404, even if audit logging was never enabled server-side (that just means the table is empty).
-
-## Platform invites
-
-```ts
-const invite = await adminApi.createInvite("ada@example.com");
-const { invites } = await adminApi.listInvites({ status: "pending" });
-const { count } = await adminApi.countInvites({ status: "pending" });
-await adminApi.resendInvite(invite.id); // issues a fresh code, invalidates the old one
-```
+- `POST /auth/admin/login` — admin login
+- `POST /auth/admin/logout` — admin logout
+- `GET /auth/admin/me` — admin profile
+- `GET /auth/admin/users` — list users
+- `POST /auth/admin/create-user` — create user
+- `DELETE /auth/admin/users/:id` — delete user
+- `PUT /auth/admin/users/:id/role` — change user role
+- `POST /auth/admin/reset-user-password` — reset user password
+- `GET /auth/admin/sessions` — list all sessions
+- `DELETE /auth/admin/sessions/:id` — terminate session
+- `POST /auth/admin/sessions/bulk-delete` — terminate multiple sessions
+- `GET /auth/admin/audit/logs` — list audit logs
+- `GET /auth/admin/audit/logs/:id` — get audit log
 
 ## Next
 
-- [Setup](./index.mdx) — the `apiRequest` helper this is built on
-- [Admin](../admin.mdx) — full request/response/error reference
-- [Audit Logs](../audit-logs.mdx) — event types and filter params
+- [Client integration](./index.mdx) — overview
+- [Admin guide](../admin.mdx) — admin setup and configuration
