@@ -4,6 +4,8 @@ description: "How go-auth maps internal failures to HTTP responses — the error
 icon: "MessageCircleWarning"
 ---
 
+import { Accordion, Accordions } from 'fumadocs-ui/components/accordion';
+
 # Error Handling
 
 Every user-facing error produced by go-auth is returned as a **single-line, structured JSON body**:
@@ -127,13 +129,14 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 
 ### Authorization
 
-<Expandable title="GET /auth/me — `internal/handler/auth.go`">
+<Accordions>
+<Accordion title="GET /auth/me — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/login — `internal/handler/auth.go`">
+<Accordion title="POST /auth/login — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; the handler continues normally. |
@@ -142,40 +145,40 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `200` | `mailer_error` — an optional email was lost before it could be delivered (e.g. verification). |
 | `200` | `ok` with `code: mailer_error` — login succeeds but an optional email (e.g. verification) failed. |
 | `429` | `rate_limited` — throttled. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/logout — `internal/handler/auth.go`">
+<Accordion title="POST /auth/logout — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; the handler continues normally. |
 | `200` | `info: session_not_found` — the session token was already invalid, but logout still returns 200. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/refresh — `internal/handler/auth.go`">
+<Accordion title="POST /auth/refresh — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; a new session token is issued. |
 | `401` | `session_expired` — the session has exceeded its absolute or idle TTL. |
 | `401` | `refresh_token_invalid` — the refresh token is unrecognized or has already been rotated. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/refresh-session — `internal/handler/auth.go`">
+<Accordion title="POST /auth/refresh-session — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; the session is refreshed. |
 | `401` | `session_invalid` — the session token is missing or the session has expired. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/end-all-sessions — `internal/handler/auth.go`">
+<Accordion title="POST /auth/end-all-sessions — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; all sessions (including the current one) are terminated. |
 | `200` | `info: session_not_found` — no active session is attached; the handler returns 200 anyway. |
-</Expandable>
+</Accordion>
 
 ### Registration
 
-<Expandable title="POST /auth/register — `internal/handler/auth.go`">
+<Accordion title="POST /auth/register — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `201` | `ok` — `nil` error; the user is created and the handler returns 201. |
@@ -185,18 +188,18 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `409` | `email_already_exists` — the email address is already registered. |
 | `429` | `rate_limited` — throttled. |
 | `200` | `mailer_error` — the verification email could not be sent; the handler still returns 200 with `code: mailer_error`. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/verify-email — `internal/handler/auth.go`">
+<Accordion title="POST /auth/verify-email — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the email is verified. |
 | `400` | `code expired` — the token expired or was already used. |
 | `404` | `not_found` — the email address was not found. |
 | `429` | `rate_limited` — throttled. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/resend-verification — `internal/handler/auth.go`">
+<Accordion title="POST /auth/resend-verification — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — a new verification code was sent. |
@@ -204,9 +207,9 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `200` | `codeSent: false` — the resend was throttled; no email was sent. |
 | `429` | `rate_limited` — throttled. |
 | `200` | `mailer_error` — the verification email could not be sent; the handler still returns 200 with `code: mailer_error`. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/invite — `internal/handler/auth.go`">
+<Accordion title="POST /auth/invite — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — an invite was sent. |
@@ -214,29 +217,29 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `409` | `email already exists` — the invitee is already a user. |
 | `429` | `rate_limited` — throttled. |
 | `200` | `mailer_error` — the invite email could not be sent; the handler still returns 200 with `code: mailer_error`. |
-</Expandable>
+</Accordion>
 
 ### Password reset flow
 
-<Expandable title="POST /auth/forgot-password — `internal/handler/auth.go`">
+<Accordion title="POST /auth/forgot-password — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; the handler continues normally. |
 | `404` | `not_found` — the email address is not registered. |
 | `429` | `rate_limited` — throttled. |
 | `200` | `mailer_error` — the password reset email could not be sent; the handler still returns 200 with `code: mailer_error`. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/reset-password — `internal/handler/auth.go`">
+<Accordion title="POST /auth/reset-password — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; the password is reset and all other sessions are terminated. |
 | `400` | `code expired` — the token expired or was already used. |
 | `400` | `weak_password` — the new password did not meet policy. |
 | `429` | `rate_limited` — throttled. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/set-password — `internal/handler/auth.go`">
+<Accordion title="POST /auth/set-password — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; the password is set. |
@@ -245,11 +248,11 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `400` | `weak_password` — the new password did not meet policy. |
 | `400` | `validation_error` — a field had the wrong type or an invalid value. |
 | `429` | `rate_limited` — throttled. |
-</Expandable>
+</Accordion>
 
 ### Account deletion
 
-<Expandable title="POST /auth/request-delete — `internal/handler/auth.go`">
+<Accordion title="POST /auth/request-delete — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; the handler continues normally. |
@@ -258,9 +261,9 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `409` | `error_already_requested` — a pending deletion request already exists. |
 | `429` | `rate_limited` — throttled. |
 | `200` | `mailer_error` — the account deletion confirmation email could not be sent; the handler still returns 200 with `code: mailer_error`. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/cancel-delete — `internal/handler/auth.go`">
+<Accordion title="POST /auth/cancel-delete — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; the pending deletion is canceled. |
@@ -268,19 +271,19 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `400` | `invalid_code` — the code is invalid. |
 | `409` | `error_not_requested` — no pending deletion request exists. |
 | `429` | `rate_limited` — throttled. |
-</Expandable>
+</Accordion>
 
 ### OAuth
 
-<Expandable title="GET /auth/oauth/:provider — `internal/handler/oauth.go`">
+<Accordion title="GET /auth/oauth/:provider — `internal/handler/oauth.go`">
 | Status | Condition |
 |---|---|
 | `302` | `ok` — the user is redirected to the provider's authorization URL. |
 | `400` | `invalid_provider` — the provider is not registered. |
 | `400` | `config_error` — the provider's configuration is incomplete (missing client ID or secret). |
-</Expandable>
+</Accordion>
 
-<Expandable title="GET /auth/oauth/:provider/callback — `internal/handler/oauth.go`">
+<Accordion title="GET /auth/oauth/:provider/callback — `internal/handler/oauth.go`">
 | Status | Condition |
 |---|---|
 | `302` | `ok` — the user is redirected to the frontend; the URL includes either `token` or `error`. |
@@ -289,20 +292,20 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `400` | `token_error` — the library could not exchange the code for an access token. |
 | `400` | `invalid_provider` — the provider is not registered. |
 | `400` | `user_info_error` — the library could not fetch user info from the provider. |
-</Expandable>
+</Accordion>
 
 ### Linking / Unlinking
 
-<Expandable title="POST /auth/oauth/link — `internal/handler/oauth.go`">
+<Accordion title="POST /auth/oauth/link — `internal/handler/oauth.go`">
 | Status | Condition |
 |---|---|
 | `302` | `ok` — the user is redirected to the provider's authorization URL with the session token included. |
 | `400` | `invalid_provider` — the provider is not registered. |
 | `400` | `config_error` — the provider's configuration is incomplete (missing client ID or secret). |
 | `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/oauth/unlink — `internal/handler/oauth.go`">
+<Accordion title="POST /auth/oauth/unlink — `internal/handler/oauth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the provider is unlinked. |
@@ -310,20 +313,20 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `400` | `not_linked` — the user has no active link with this provider. |
 | `400` | `cannot_unlink_only_method` — the user has no password and no other linked provider; unlinking would lock them out. |
 | `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
-</Expandable>
+</Accordion>
 
 ### Token introspection
 
-<Expandable title="GET /auth/introspect — `internal/handler/auth.go`">
+<Accordion title="GET /auth/introspect — `internal/handler/auth.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; the handler continues normally. |
 | `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
-</Expandable>
+</Accordion>
 
 ### Mailer
 
-<Expandable title="POST /auth/mailer/test — `internal/handler/mailer.go`">
+<Accordion title="POST /auth/mailer/test — `internal/handler/mailer.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the test email was delivered successfully. |
@@ -331,11 +334,11 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `400` | `validation_error` — a field had the wrong type or an invalid value. |
 | `200` | `mailer_error` — the test email could not be sent; the handler still returns 200 with `code: mailer_error`. |
 | `429` | `rate_limited` — throttled. |
-</Expandable>
+</Accordion>
 
 ### 2FA
 
-<Expandable title="POST /auth/2fa/verify — `internal/handler/two_factor.go`">
+<Accordion title="POST /auth/2fa/verify — `internal/handler/two_factor.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the 2FA code is valid; the session is fully authenticated. |
@@ -343,9 +346,9 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `400` | `invalid_code` — the code is invalid. |
 | `401` | `session_invalid` — the session token is missing or the session has expired. |
 | `429` | `rate_limited` — throttled. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/2fa/resend — `internal/handler/two_factor.go`">
+<Accordion title="POST /auth/2fa/resend — `internal/handler/two_factor.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — `nil` error; the handler continues normally. |
@@ -353,56 +356,56 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `200` | `codeSent: false` — the resend was throttled; no email was sent. |
 | `429` | `rate_limited` — throttled. |
 | `200` | `mailer_error` — the 2FA code email could not be sent; the handler still returns 200 with `code: mailer_error`. |
-</Expandable>
+</Accordion>
 
 ### Session management
 
-<Expandable title="GET /auth/sessions — `internal/handler/session.go`">
+<Accordion title="GET /auth/sessions — `internal/handler/session.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the session list is returned. |
 | `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
-</Expandable>
+</Accordion>
 
-<Expandable title="DELETE /auth/sessions/:id — `internal/handler/session.go`">
+<Accordion title="DELETE /auth/sessions/:id — `internal/handler/session.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the session is terminated. |
 | `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
 | `404` | `not_found` — the session does not exist or does not belong to the current user. |
-</Expandable>
+</Accordion>
 
 ### Audit log
 
-<Expandable title="GET /auth/audit/logs — `internal/handler/audit.go`">
+<Accordion title="GET /auth/audit/logs — `internal/handler/audit.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the log list is returned. |
 | `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
 | `403` | `forbidden` — the user does not have `audit_log:read` permission. |
-</Expandable>
+</Accordion>
 
-<Expandable title="GET /auth/audit/logs/:id — `internal/handler/audit.go`">
+<Accordion title="GET /auth/audit/logs/:id — `internal/handler/audit.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the log detail is returned. |
 | `401` | `session_token_invalid_or_missing` — no valid session is attached to the request. |
 | `403` | `forbidden` — the user does not have `audit_log:read` permission. |
 | `404` | `not_found` — the log does not exist. |
-</Expandable>
+</Accordion>
 
 ### CSRF
 
-<Expandable title="GET /auth/csrf-token — `internal/handler/csrf.go`">
+<Accordion title="GET /auth/csrf-token — `internal/handler/csrf.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the CSRF token is returned. |
 | `400` | `method_not_allowed` — the method is not allowed. |
-</Expandable>
+</Accordion>
 
 ### Admin
 
-<Expandable title="POST /auth/admin/login — `internal/handler/admin.go`">
+<Accordion title="POST /auth/admin/login — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the admin user is logged in and the session token is returned. |
@@ -411,31 +414,31 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `200` | `codeSent: false` — the resend was throttled; no email was sent. |
 | `403` | `admin_login_blocked` — the admin account is locked. |
 | `429` | `rate_limited` — throttled. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/admin/logout — `internal/handler/admin.go`">
+<Accordion title="POST /auth/admin/logout — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the admin session is terminated. |
 | `200` | `info: session_not_found` — the session token was already invalid, but logout still returns 200. |
-</Expandable>
+</Accordion>
 
-<Expandable title="GET /auth/admin/me — `internal/handler/admin.go`">
+<Accordion title="GET /auth/admin/me — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the admin user info is returned. |
 | `401` | `admin_session_invalid` — the admin session is not valid. |
-</Expandable>
+</Accordion>
 
-<Expandable title="GET /auth/admin/users — `internal/handler/admin.go`">
+<Accordion title="GET /auth/admin/users — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the user list is returned. |
 | `401` | `admin_session_invalid` — the admin session is not valid. |
 | `403` | `forbidden` — the admin user does not have the required role. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/admin/create-user — `internal/handler/admin.go`">
+<Accordion title="POST /auth/admin/create-user — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `201` | `ok` — the user is created and the handler returns 201. |
@@ -446,18 +449,18 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `403` | `forbidden` — the admin user does not have the required role. |
 | `409` | `email_already_exists` — the email address is already registered. |
 | `200` | `mailer_error` — the admin-created user's verification email could not be sent; the handler still returns 200 with `code: mailer_error`. |
-</Expandable>
+</Accordion>
 
-<Expandable title="DELETE /auth/admin/users/:id — `internal/handler/admin.go`">
+<Accordion title="DELETE /auth/admin/users/:id — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the user is deleted. |
 | `401` | `admin_session_invalid` — the admin session is not valid. |
 | `403` | `forbidden` — the admin user does not have the required role. |
 | `404` | `not_found` — the user was not found. |
-</Expandable>
+</Accordion>
 
-<Expandable title="PUT /auth/admin/users/:id/role — `internal/handler/admin.go`">
+<Accordion title="PUT /auth/admin/users/:id/role — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the user role is updated. |
@@ -466,9 +469,9 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `401` | `admin_session_invalid` — the admin session is not valid. |
 | `403` | `forbidden` — the admin user does not have the required role. |
 | `404` | `not_found` — the user was not found. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/admin/reset-user-password — `internal/handler/admin.go`">
+<Accordion title="POST /auth/admin/reset-user-password — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the user password is reset. |
@@ -476,9 +479,9 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `401` | `admin_session_invalid` — the admin session is not valid. |
 | `403` | `forbidden` — the admin user does not have the required role. |
 | `404` | `not_found` — the user was not found. |
-</Expandable>
+</Accordion>
 
-<Expandable title="DELETE /auth/admin/delete-user — `internal/handler/admin.go`">
+<Accordion title="DELETE /auth/admin/delete-user — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the user is deleted. |
@@ -488,26 +491,26 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `401` | `admin_session_invalid` — the admin session is not valid. |
 | `403` | `forbidden` — the admin user does not have the required role. |
 | `500` | `internal_error` — the event hook failed or the transaction could not be committed. |
-</Expandable>
+</Accordion>
 
-<Expandable title="GET /auth/admin/sessions — `internal/handler/admin.go`">
+<Accordion title="GET /auth/admin/sessions — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the session list is returned. |
 | `401` | `admin_session_invalid` — the admin session is not valid. |
 | `403` | `forbidden` — the admin user does not have the required role. |
-</Expandable>
+</Accordion>
 
-<Expandable title="DELETE /auth/admin/sessions/:id — `internal/handler/admin.go`">
+<Accordion title="DELETE /auth/admin/sessions/:id — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the session is terminated. |
 | `401` | `admin_session_invalid` — the admin session is not valid. |
 | `403` | `forbidden` — the admin user does not have the required role. |
 | `404` | `not_found` — the session was not found. |
-</Expandable>
+</Accordion>
 
-<Expandable title="POST /auth/admin/sessions/bulk-delete — `internal/handler/admin.go`">
+<Accordion title="POST /auth/admin/sessions/bulk-delete — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the sessions are terminated. |
@@ -515,24 +518,25 @@ The table covers every `Errorf(...)`, `response.Error`, or `response.ErrorIntern
 | `400` | `validation_error` — a field had the wrong type or an invalid value. |
 | `401` | `admin_session_invalid` — the admin session is not valid. |
 | `403` | `forbidden` — the admin user does not have the required role. |
-</Expandable>
+</Accordion>
 
-<Expandable title="GET /auth/admin/audit/logs — `internal/handler/admin.go`">
+<Accordion title="GET /auth/admin/audit/logs — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the log list is returned. |
 | `401` | `admin_session_invalid` — the admin session is not valid. |
 | `403` | `forbidden` — the admin user does not have the required role. |
-</Expandable>
+</Accordion>
 
-<Expandable title="GET /auth/admin/audit/logs/:id — `internal/handler/admin.go`">
+<Accordion title="GET /auth/admin/audit/logs/:id — `internal/handler/admin.go`">
 | Status | Condition |
 |---|---|
 | `200` | `ok` — the log detail is returned. |
 | `401` | `admin_session_invalid` — the admin session is not valid. |
 | `403` | `forbidden` — the admin user does not have the required role. |
 | `404` | `not_found` — the log was not found. |
-</Expandable>
+</Accordion>
+</Accordions>
 
 ## Next
 
