@@ -1,91 +1,242 @@
 ---
 title: "Audit Logs"
-description: "Recording and querying security-relevant events."
+description: "Turning on audit logging, what gets recorded, and the two admin endpoints for querying it."
 icon: "ScrollText"
 ---
 
 # Audit Logs
 
-go-auth includes built-in audit logging for security-relevant events. Audit logs are append-only — they are created on events and never updated or deleted by the library.
+Audit logging is **off by default**. When it's on, every significant thing that happens — logins, password changes, admin actions, org membership changes — gets published as a structured `audit.Event` to an internal queue, processed by background workers, and (if you configured a store) queryable through the two endpoints below.
 
-## Setup
-
-Enable audit logging with `WithAudit`:
+## Configuration
 
 ```go
 goauth.WithAudit(goauth.AuditConfig{
-    Enabled:       true,
-    FailureMode:   audit.AuditFailureOpen, // or audit.AuditFailureClosed
-    RetentionDays: 90,                     // 0 = keep forever
-    QueueSize:     1000,
-    Workers:       3,
-    BatchSize:     50,
-    FlushInterval: 100 * time.Millisecond,
-    Sinks:         []audit.EventSink{myKafkaSink},
+    Enabled:       true,                    // optional, default false
+    FailureMode:   audit.AuditFailureOpen,   // optional, default fail-open — or audit.AuditFailureClosed
+    RetentionDays: 0,                       // optional, default 0 — keep forever (0 = forever)
+    QueueSize:     1000,                     // optional, default 1000
+    Workers:       3,                        // optional, default 3
+    BatchSize:     50,                       // optional, default 50
+    FlushInterval: 100 * time.Millisecond,   // optional, default 100ms
+    Sinks:         []audit.EventSink{myKafkaSink}, // optional, default none
 })
+goauth.WithAuditSink(myOtherSink) // optional — adds one more sink at a time
 ```
 
-Audit writes are asynchronous, fire-and-forget, and non-blocking. A failed audit write never fails the request — the error is logged at `ERROR` level and the request continues normally.
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `Enabled` | `bool` | `false` | The two endpoints below still work while this is off — they just return no events, since none were ever published. |
+| `FailureMode` | `audit.AuditFailureMode` | fail-open | Controls asynchronous sink fan-out after a sink fails: fail-open logs the error and continues to later sinks; fail-closed logs the error and stops processing that batch. It never changes whether the request that triggered the event succeeds or fails. |
+| `RetentionDays` | `int` | `0` | `0` means keep forever. |
+| `QueueSize` | `int` | `1000` | Events are published asynchronously onto this queue. If it is full, the event is dropped with a warning regardless of `FailureMode`; publishing never blocks or fails the triggering request. |
+| `Workers` | `int` | `3` | Background goroutines draining the queue. |
+| `BatchSize` | `int` | `50` | Events per batch write to the store. |
+| `FlushInterval` | `time.Duration` | `100ms` | Max time a partial batch waits before flushing anyway. |
+| `Sinks` | `[]audit.EventSink` | none | Extra destinations — Kafka, NATS, a webhook — fired in addition to the queryable store. |
 
-## What gets logged
+`WithAuditSink` appends one sink at a time without needing to repeat the whole config; calling `WithAudit` more than once doesn't duplicate sinks already added.
 
-Every security-relevant event is logged:
+<Callout type="info" title="This is separate from application logging">
+  `config.Logger` (the `*slog.Logger` you pass to `WithLogger`) is for operational logs — errors, warnings, debug output. Audit events are a distinct, structured stream meant to answer "who did what, when" for security review or compliance, and only exist at all if `Enabled: true` here.
+</Callout>
 
-- Login (success and failure)
-- Registration
-- Password change and reset
-- Email verification
-- 2FA verification
-- Session creation and termination
-- OAuth login, linking, and unlinking
-- Admin actions (user creation, deletion, role changes, password resets)
-- Account deletion requests
+## Frontend client setup
 
-Each audit log entry includes:
+The **Client** examples below call the same `apiRequest(baseUrl, method, path, body)` helper used throughout these guides — see [Client → Setup](./client/index.mdx). The named-method wrapper for both endpoints on this page lives on [Client → Admin](./client/admin.mdx#audit-logs).
 
-- `user_id` — the user who performed the action (null for system events)
-- `action` — the event name (e.g. `login`, `register`, `password_reset`)
-- `details` — arbitrary JSONB payload (e.g. `{"method": "password"}`)
-- `ip_address` — client IP
-- `user_agent` — client identification string
-- `created_at` — when the event occurred
+## What gets recorded
+
+Every event carries a `type`, a `severity` (`info` / `warning` / `error` / `critical`), whether it `success`ed, and — depending on the event — an actor, a target user, a session, an org, an IP, and a user agent. The full type list, grouped by area:
+
+| Area | Event types |
+|---|---|
+| Login | `login.success`, `login.failed`, `login.locked`, `logout`, `admin.login.success`, `admin.login.failed` |
+| Registration | `user.registered` |
+| Email | `email.verification.sent`, `email.verified` |
+| Password | `password.changed`, `password.reset.requested`, `password.reset.completed` |
+| Sessions | `session.created`, `session.refreshed`, `session.revoked`, `session.revoked_all`, `session.refresh_reuse_detected` |
+| OAuth | `oauth.login`, `oauth.linked`, `oauth.unlinked` |
+| Admin | `admin.user.created`, `admin.user.updated`, `admin.user.deleted`, `admin.user.banned`, `admin.user.unbanned` |
+| Roles | `role.changed` |
+| Organizations | `organization.created`, `organization.deleted`, `organization.member.invited`, `organization.member.removed`, `organization.member.role_changed` |
+| Admin — organizations | `admin.org.deleted`, `admin.org.member.added`, `admin.org.member.removed`, `admin.org.member.role_changed`, `admin.org.viewed` |
+
+This list can grow across versions — treat `event_type` as an opaque string in your filters rather than an exhaustive enum you validate against.
+
+<Callout type="info" title="Admin-organization events are always distinct from the self-service ones">
+  A platform admin using `auth.Services.Org.AdminDeleteOrg`/`AdminRemoveMember`/`AdminUpdateMemberRole` publishes `admin.org.*`, never the plain `organization.*` type the org's own owner/admin would publish for the same action — so "the owner deleted their org" and "a platform admin force-deleted it" never look identical in the log. `admin.org.deleted` also carries the org's `name`/`slug` in its `metadata`, snapshotted at the moment of deletion — the `organizations` row is hard-deleted, so nothing else could resolve `orgId` back to a name afterward (the same limitation as the deleted-user email case below, applied to orgs).
+</Callout>
 
 ## Querying audit logs
 
-Audit logs are accessible via:
+### List all audit logs — `GET /admin/audit-logs`
 
-- `GET /auth/audit/logs` — current user's logs
-- `GET /auth/audit/logs/:id` — single log entry
-- `GET /auth/admin/audit/logs` — all logs (admin only)
-- `GET /auth/admin/audit/logs/:id` — single log entry (admin only)
+**Query params** (all optional)
 
-## Retention
+| Param | Type | Notes |
+|---|---|---|
+| `offset` | int | Default `0` |
+| `limit` | int | Default `50`, max `200` |
+| `event_type` | comma-separated string | Matches any of the listed types — `event_type=login.success,logout`. A single value still works exactly like before. |
+| `actor_id` | string | Who performed the action, by ID |
+| `actorEmail` | string | Who performed the action, by email — resolved to an ID server-side. `404 user_not_found` if no user has it. If both `actor_id` and `actorEmail` are given, `actorEmail` wins. |
+| `target_user_id` | string | Who the action was performed on, by ID |
+| `targetEmail` | string | Who the action was performed on, by email — same resolve-and-win rule as `actorEmail` |
+| `session_id` | string | |
+| `org_id` | string | |
+| `deviceType` | string | Exact match against the parsed user agent's device type — `mobile`, `desktop`, `tablet`, or `bot` |
+| `ip` | string | Exact match against the stored IP |
+| `search` | string | Substring match across metadata, user agent, IP, and event type — a general free-text box, composes with every field filter above via AND |
+| `from`, `to` | RFC3339 datetime | Independently optional — either, both, or neither. Silently ignored if the value doesn't parse — no error, just no filter applied |
+| `success` | `true` \| `false` | Anything else is ignored |
 
-By default, audit logs are kept forever. Set `RetentionDays` to enable automatic cleanup:
+<Callout type="info" title="actorEmail/targetEmail only find currently-existing users">
+  Both resolve against the *current* `users` table by email. If the user was later deleted or changed their email, you can't look up their historical events this way — filter by `actor_id`/`target_user_id` instead if you already have it (e.g. from a linked event).
+</Callout>
 
-```go
-goauth.WithAudit(goauth.AuditConfig{
-    Enabled:       true,
-    RetentionDays: 90, // keep logs for 90 days
-})
-```
+**Response** (`200 OK`)
 
-A background cleanup job runs periodically and deletes logs older than the retention period.
-
-## Custom sinks
-
-You can send audit events to external systems (Kafka, NATS, webhooks) by implementing the `audit.EventSink` interface:
-
-```go
-type EventSink interface {
-    Send(ctx context.Context, event audit.Event) error
-    Close() error
+```json
+{
+  "events": [
+    {
+      "id": "...",
+      "type": "login.failed",
+      "severity": "warning",
+      "success": false,
+      "actorId": null,
+      "actorEmail": null,
+      "targetUserId": null,
+      "targetEmail": null,
+      "sessionId": null,
+      "orgId": null,
+      "ip": "192.168.1.1",
+      "userAgent": "Mozilla/5.0 ...",
+      "requestId": "...",
+      "metadata": {},
+      "createdAt": "2026-08-09T12:00:00Z"
+    }
+  ],
+  "limit": 50,
+  "offset": 0
 }
 ```
 
-Register sinks via `WithAuditSink` or the `Sinks` field in `AuditConfig`.
+The list response carries no total — fetch it from [Count audit logs](#count-audit-logs--get-adminaudit-logscount) below.
+
+`actorEmail`/`targetEmail` are resolved server-side from `actorId`/`targetUserId` for the returned page — not stored, and `null` if the corresponding `*Id` is `null` or that user no longer exists.
+
+**Errors**
+
+| Code | Status | Cause |
+|---|---|---|
+| `user_not_found` | 404 | `actorEmail`/`targetEmail` given but no user has that email |
+| `forbidden` | 403 | Caller isn't an admin |
+| `internal_error` | 500 | Query failure against the store |
+
+<Callout type="info" title="Empty, not an error, if audit logging was never enabled">
+  `WithAudit(AuditConfig{Enabled: true})` being unset just means no events were ever published — the query still runs, it just returns `{"events": [], ...}` (and `/count` returns `{"count": 0}`).
+</Callout>
+
+#### curl
+
+```bash
+curl "https://api.myapp.com/admin/audit-logs?event_type=login.failed&limit=50" \
+  -H "Origin: https://myapp.com" \
+  -b admin-cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+result, err := auth.Services.Admin.ListAuditLogs(ctx, goauth.AdminListAuditLogsInput{
+    ActorID:    adminID, // the admin making this call
+    EventTypes: []string{"login.failed"},
+    Limit:      50,
+})
+// result.Events
+```
+
+`AdminService.ListAuditLogs` — not `auth.Services.AuditLog.List` directly — is the supported programmatic path: it's what resolves `EventActorEmail`/`TargetEmail` to IDs and enforces the calling actor is an admin, same as every other `auth.Services.Admin.*` method.
+
+---
+
+#### Client
+
+```ts
+const { events } = await apiRequest(
+  API_BASE, "GET", "/admin/audit-logs?event_type=login.failed&limit=50"
+);
+```
+
+See [Client → Audit logs](./client/admin.mdx#audit-logs) for the wrapper, data table, and filters.
+
+---
+
+### Count audit logs — `GET /admin/audit-logs/count`
+
+The matching total for the list, split into its own call so a paginated log view doesn't run a `COUNT(*)` on every page. Takes every filter param of the list except `offset`/`limit`.
+
+**Response** (`200 OK`): `{ "count": 1000 }`
+
+```go
+n, err := auth.Services.Admin.CountAuditLogs(ctx, goauth.AdminListAuditLogsInput{
+    ActorID:    adminID,
+    EventTypes: []string{"login.failed"},
+})
+```
+
+```ts
+const { count } = await apiRequest(API_BASE, "GET", "/admin/audit-logs/count?event_type=login.failed");
+```
+
+See [Client → Audit logs](./client/admin.mdx#audit-logs) for the wrapper.
+
+`GET /admin/users/{id}/audit-logs/count` is the same, scoped to one user (see below).
+
+---
+
+### List one user's audit logs — `GET /admin/users/{id}/audit-logs`
+
+Identical query params and response shape to the endpoint above — this one just forces `target_user_id` to the `{id}` in the path, overriding anything passed in the query string for `target_user_id`/`targetEmail`. Its total lives at `GET /admin/users/{id}/audit-logs/count`.
+
+#### curl
+
+```bash
+curl "https://api.myapp.com/admin/users/b3f1.../audit-logs?limit=50" \
+  -H "Origin: https://myapp.com" \
+  -b admin-cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+result, err := auth.Services.Admin.ListAuditLogs(ctx, goauth.AdminListAuditLogsInput{
+    ActorID:      adminID,
+    TargetUserID: &userID,
+    Limit:        50,
+})
+```
+
+---
+
+#### Client
+
+```ts
+const { events } = await apiRequest(API_BASE, "GET", `/admin/users/${userId}/audit-logs`);
+const { count } = await apiRequest(API_BASE, "GET", `/admin/users/${userId}/audit-logs/count`);
+```
+
+See [Client → Audit logs](./client/admin.mdx#audit-logs) for the wrapper and data table.
+
+---
 
 ## Next
 
-- [Configuration](../configuration.mdx) — `WithAudit` and `WithAuditSink`
-- [Security](../security.mdx) — the threat model and what gets logged
+- [Admin](./admin.mdx) — most of the actions that show up as `admin.*` events here
+- [Routes](../routes/admin.mdx#audit-logs) — full param reference

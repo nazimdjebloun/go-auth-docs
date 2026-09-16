@@ -1,84 +1,62 @@
 ---
-title: "go-auth"
-description: "An importable authentication and session library for Go HTTP services"
+title: "Introduction"
+description: "What go-auth is, why it exists, what it does, and how it compares to rolling your own auth or using a hosted provider."
+icon: "BookOpen"
 ---
 
-import { Tabs } from 'fumadocs-ui/components/tabs';
-import { Callout } from 'fumadocs-ui/components/callout';
-import { Tab } from 'fumadocs-ui/components/tabs';
+# Introduction
 
-# go-auth
+A self-hosted authentication library for Go. Run it in your application against your database for registration, sessions, password recovery, email verification, invite-only signup, OAuth, organizations, administration, CSRF protection, rate limiting, and audit logging.
 
-A drop-in Go library for email/password authentication, optional OAuth 2.1, and optional multi-tenant organizations, backed by SQLite or PostgreSQL — or both during migration.
+<Callout type="warn" title="Pre-1.0: expect breaking changes">
+  go-auth is early and under active development. The public API (types, `With*` options, route paths, and JSON response shapes) can and will change without a deprecation period until a 1.0 release is tagged. Pin an exact version, read the changelog before upgrading, and do not treat this as a stable dependency yet.
+</Callout>
 
-**This is not a standalone service.** go-auth is a Go library that embeds directly into your application. You call `goauth.New`, mount the returned handler onto your HTTP server, and the library handles login, registration, CSRF protection, OAuth, sessions, and optionally organizations — all from inside your process. There is no sidecar, no separate binary, and no deployment topology to manage beyond your own service.
+## Why it exists
 
-Your application controls how it starts, where it binds, which middleware surrounds the auth routes, and how it shuts down. go-auth provides the handler; your application provides the HTTP server.
+Use go-auth when you want authentication to run with your Go application and data to remain in your PostgreSQL, MySQL, or SQLite database. You own the deployment, configuration, and operational security.
 
-For the most part you won't need to touch the database directly — the library handles setup, migrations, sessions, and most admin tasks. The routes and handlers expose what the library intentionally does not, typically because exposing it in the library would create a public API for something an application or platform should control: inviting new users, inviting users to organizations, and managing organization-wide settings and permissions. For the rest, the library already exposes complete programmatic APIs, and the routes are one layer above that — a thin HTTP mapping over what the application could do directly through `Auth` methods.
+## What it does
 
-go-auth is a Go library, not a standalone app. It exposes Go APIs and an optional `net/http` handler. Use it directly in your Go application — there is no external deployment for the library itself. The separate `cmd/goauth` CLI is only for local development (scaffolding a new database) or one-time bootstrap (creating an initial admin user). It starts no servers.
+Authentication supports email/password, OAuth (Google and GitHub are built in), and invite-only signup. Sessions have a session token and refresh token, rotation, idle expiry, and an optional maximum lifetime. The library also provides account recovery, email verification, organizations, administrative operations, rate limiting, audit events, and structured logging.
 
-```go
-import "github.com/nazimdjebloun/go-auth"
-```
+Use the supplied interfaces to replace email delivery, templates, OAuth providers, rate-limit storage, or audit sinks.
 
-go-auth provides two layers you can use:
+## Comparison
 
-- **`Auth`** — the full API: `Login`, `Register`, `RefreshSession`, `CreateOrganization`, and every other operation. It takes and returns plain values — no HTTP, no request parsing, no response writing. Use it from any Go code: tests, workers, CLIs, other handlers, anywhere.
-- **`Handler`** — the optional HTTP layer. Mount it on a `*http.ServeMux` and it translates HTTP requests into `Auth` calls. It reads and writes JSON, but knows nothing about sessions, cookies, or middleware — those are your application's concerns.
+| | Rolling your own | Hosted auth-as-a-service | go-auth |
+|---|---|---|---|
+| Where your data lives | Your database | Their servers | Your database |
+| Ongoing cost | Infrastructure and maintenance | Provider and infrastructure pricing | Infrastructure and maintenance; no go-auth per-user fee |
+| Setup effort | Build and maintain the system | Integrate the provider | Integrate the library into your service and deployment |
+| Security responsibility | Your implementation and deployment | Provider configuration and application integration | Your application integration and deployment; evaluate the library against your requirements |
+| Network dependency at runtime | None | Yes: auth calls leave your infrastructure | None |
+| Customization | Total, but you built it | Limited to what the provider exposes | Total: Go source you can read and fork if needed |
 
-Your application is responsible for setting up middleware, CORS, and the HTTP server itself.
+## Features
 
-## Feature overview
+**Authentication**: email/password and OAuth registration and login, invite-only signup, optional required email verification, admin login separate from regular login.
 
-<Tabs items={['Authentication', 'Core infrastructure', 'Multi-tenancy & admin', 'OAuth 2.1']}>
-  <Tab value="Authentication">
-    Email/password authentication with optional peppered passwords, OTP-based two-factor authentication, email verification, and invite-only registration. The 2FA login code is always delivered by email. Peer comparison and similar-username lockout are built-in.
-  </Tab>
-  <Tab value="Core infrastructure">
-    Token refresh, session management, CSRF double-submit, rate limiting, and a full audit-log sink. Audit writes are asynchronous, fire-and-forget, non-blocking, and never fail the request.
-  </Tab>
-  <Tab value="Multi-tenancy & admin">
-    Organizations are optional. Admin users get a separate `/auth/admin/*` surface with its own session scope and a two-factor gate. Admin is disabled outside development by default.
-  </Tab>
-  <Tab value="OAuth 2.1">
-    An optional provider layer for OAuth 2.1 login, registration, account linking, and unlinking. Built-in providers are stateless in production — no OAuth state is written to the database. Their HTTP handlers are one public surface the library does provide, but they remain optional.
-  </Tab>
-</Tabs>
+**Sessions**: dual-token (session + refresh) with rotation, idle timeout, absolute max lifetime, configurable grace window for racing refresh requests, and a debounce on activity tracking.
 
-## What this guide covers
+**Account lifecycle**: forgot/reset password, change password, set password for OAuth-only accounts, change name, self-service and admin-initiated account deletion.
 
-Everything here is for the **Go library**. You will not find deployment manifests, service topology, or application-wide concerns here.
+**Organizations**: multi-tenant orgs with owner/admin/member roles, invites, and an active-org concept per session.
 
-| Section | What it covers |
-|---|---|
-| [Installation](./installation.mdx) | Prerequisites, supported databases, and setting up the library. |
-| [Configuration](./configuration.mdx) | Every configuration option, field by field — required vs optional, defaults, and the exact validation errors each one can produce. |
-| [Routes](./routes.mdx) | The complete HTTP surface: every route, method, request shape, and response contract. |
-| [Schemas](./schemas.mdx) | Internal database models — what the library owns and manages. |
-| [Error handling](./error-handling.mdx) | The two-layer log structure, error taxonomy, and exhaustive error table. |
-| [Security](./security.mdx) | Threat model, session security, CSRF, rate limiting, and security hardening. |
-| [Guides](./guides/authentication.mdx) | Longer walkthroughs: admin setup, sessions, authentication, audit logs, and rate limiting. |
-| [Client integration](./guides/client/index.mdx) | How to integrate go-auth from a frontend or mobile app. |
+**Admin**: list/detail/ban/unban/role-change/delete for users, per-user session listing and revocation, platform-wide org oversight, invite management, audit log viewing.
 
-## Two use cases
 
-go-auth covers two distinct use cases, and most of the documentation separates them:
+**Security**: CSRF origin checking plus a double-submit cookie layer, both on by default, per-route rate limiting, configurable password policy, tri-state cookie `Secure` and email-link `http://` policy with per-environment defaults.
 
-1. **Integrating go-auth into a Go service** — the primary use case. This is what the reference pages, guides, and most of the configuration documentation cover.
-2. **Integrating a frontend or client with the go-auth API surface** — the second use case. This is covered in the [Client integration](./guides/client/index.mdx) guide.
+**Audit logging**: off by default. Opt in with one flag for an async, non-blocking event pipeline with a built-in database sink. Add your own sinks (Kafka, NATS, a webhook, anything implementing one interface) with fail-open or fail-closed behavior.
 
-## What go-auth does not do
+**Logging**: a single structured `slog.Logger` used everywhere in the library (sessions, CSRF, rate limiting, audit, admin actions). Bring your own handler (JSON, text, or a third-party `slog` backend).
 
-go-auth does not provision your HTTP server, database, or schema. The only schema it interacts with is its own, and the only database operations it runs against the application schema are admin helpers (`ListUsers`, `DeleteUser`, `SetUserRole`) and the direct exports documented in the [Guides](./guides/authentication.mdx). It provides the handler; your application provides the server.
+**Extensibility**: every external dependency is a small interface you can replace: `OAuthProvider` for providers beyond the built-in two (Google, GitHub), `Mailer` for email delivery (Resend, Postmark, SES, your own SMTP client), `TemplateProvider` for your own email branding, `ratelimit.Store` for a distributed rate limiter, and `audit.EventSink` for custom audit destinations.
 
-go-auth intentionally does not own migrations, environment configuration, startup orchestration, CORS, or logging — the application already has those, and owning them inside the library would make it unsuitable for most real-world services.
-
-## Keep the examples off the main branch
-
-Every example, sample config, and tutorial in this documentation assumes a single-developer or proof-of-concept setup. Credentials are plaintext, middleware is minimal, and there is no HTTPS termination, reverse proxy, or build pipeline. Do not merge anything derived from these examples into a production branch without replacing every placeholder with a real secret, adding the middleware this documentation deliberately omits, and locking down the environment — otherwise you're deploying a demo, not a service.
+**Storage**: PostgreSQL, MySQL, or SQLite, with the schema embedded in the library.
 
 ## Next
 
-- [Installation](./installation.mdx) — prerequisites and installation
+- [Installation](./installation.mdx): prerequisites and what you need before configuring
+- [Configuration](./configuration.mdx): every option, field by field

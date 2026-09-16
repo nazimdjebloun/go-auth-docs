@@ -1,80 +1,819 @@
 ---
 title: "Organizations"
-description: "Multi-tenant organization management."
+description: "Multi-tenant orgs — creating and managing them, membership and roles, active-org scoping, and invites. curl, Go, and a browser client."
 icon: "Building2"
 ---
 
 # Organizations
 
-go-auth includes optional multi-tenant organization support. Organizations allow users to belong to multiple teams or tenants, each with their own members, roles, and audit logs.
+Multi-tenancy: users can belong to more than one organization, hold a different role in each, and scope a session to one of them at a time. Disabled by default — with `WithOrganizations` unset (or `Enable: false`), none of the routes on this page are mounted at all, and `h.services.Org` is `nil`.
 
-## Setup
+For state-changing requests, every curl example below needs the same `-H "Origin: https://myapp.com"` treatment as [Authentication](./authentication.mdx#origin-checking) — omitted from most snippets below for brevity, but required in practice.
 
-Enable organizations with `WithOrganizations`:
+## Configuration
 
 ```go
 goauth.WithOrganizations(goauth.OrganizationConfig{
-    Enable:         true,
+    Enable:         true,               // optional, default false
     MaxOrgsPerUser: 10,                 // optional, default 0 (built-in cap of 100)
     InviteTTL:      7 * 24 * time.Hour, // optional, default 7d
 })
 ```
 
-When `Enable` is false, no organization routes are mounted and the organization tables are not created.
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `Enable` | `bool` | Optional | `false` | Nothing on this page exists until this is `true`. |
+| `MaxOrgsPerUser` | `int` | Optional | `0` — built-in cap of 100 | Counts orgs a user **owns**, not every org they're a member of. Enforced on both org creation and being granted/invited as Owner. |
+| `InviteTTL` | `time.Duration` | Optional | `7d` | How long a code from [Creating an invite](#creating-an-invite--post-authorgsorgidinvites) stays valid. |
 
-## Organization roles
+**Expected errors**
 
-Each member has one of three roles:
+- `organizations.max_orgs_per_user must be between 0 and 100 (0 = default 100)`
+- `organizations.invite_ttl must be positive` — hint: only reachable via an explicit negative value.
 
-- **owner** — full control. Can delete the organization, manage all members, and transfer ownership.
-- **admin** — can manage members, invites, and settings. Cannot delete the organization.
-- **member** — basic access. Can view organization data and manage their own membership.
+Full reference: [Configuration → WithOrganizations](../configuration.mdx#withorganizations-optional).
 
-## Creating organizations
+## Frontend client setup
 
-Users create organizations via `POST /auth/org`. The creator becomes the owner.
+The **Client** examples below call the same `apiRequest` helper defined on [Client → Setup](./client/index.mdx).
+
+## Roles
+
+Roles are compared by weight, not by name. `RequireOrgRole(min)` checks `role.Weight() >= min.Weight()`, so “Admin or above” means weight 2 or higher.
+
+| Role | Weight | Can |
+|---|---|---|
+| `owner` | 3 | Everything, including deleting the org and granting/revoking Owner |
+| `admin` | 2 | Manage members and invites, update org name/slug — everything except delete the org or touch Owner status |
+| `member` | 1 | Read the org, leave it |
+
+<Callout type="warn" title="Granting or revoking Owner requires being an Owner yourself">
+  This is checked separately from the route-level `RequireOrgRole`, inside the service layer: [Change a member's role](#change-a-members-role--patch-authorgsorgidmembersuseridrole) and [Creating an invite](#creating-an-invite--post-authorgsorgidinvites) both special-case the `owner` role — an Admin can promote a Member to Admin (that's normal `RequireOrgRole(admin)` territory), but cannot self-escalate to Owner or hand Owner to anyone else. Only an existing Owner can create or remove another Owner. Attempting it as anything less returns `org_forbidden`, distinct from the route-level `403` you'd get for not being an Admin at all.
+</Callout>
+
+Every org-scoped route below runs through `RequireOrgMember` first (reads `{orgID}` from the path, `404 org_member_not_found` if you're not a member — indistinguishable from the org not existing, on purpose), then `RequireOrgRole` if the action needs more than plain membership.
+
+## Creating and reading orgs
+
+### Create an org — `POST /auth/orgs`
+
+Auth: any authenticated user. Body: `{ "name", "slug" }`. The caller becomes the org's first member, with role `owner`.
 
 ```json
 {
-  "name": "My Organization",
-  "slug": "my-org"
+  "id": "a1b2...",
+  "name": "Acme Inc",
+  "slug": "acme",
+  "createdBy": "b3f1...",
+  "ownerCount": 1,
+  "memberCount": 1,
+  "metadata": {},
+  "createdAt": "2026-08-09T12:00:00Z",
+  "updatedAt": "2026-08-09T12:00:00Z"
 }
 ```
 
-## Inviting members
+| Code | Status | Cause |
+|---|---|---|
+| `invalid_name` | 400 | `name` is empty |
+| `invalid_slug` | 400 | `slug` is over 255 bytes |
+| `org_slug_reserved` | 400 | `slug` is one of the reserved words (`api`, `admin`, `auth`, `www`, ... — see [Configuration](../configuration.mdx) for the full list) |
+| `org_slug_exists` | 409 | Another org already has that slug |
+| `org_limit_reached` | 400 | Caller already owns `MaxOrgsPerUser` orgs |
 
-Owners and admins can invite users via `POST /auth/org/:id/invite`:
+---
+
+#### curl
+
+```bash
+curl -X POST https://api.myapp.com/auth/orgs \
+  -H "Content-Type: application/json" \
+  -H "Origin: https://myapp.com" \
+  -b cookies.txt -c cookies.txt \
+  -d '{"name":"Acme Inc","slug":"acme"}'
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+org, err := auth.Services.Org.CreateOrg(ctx, goauth.CreateOrgInput{
+    Name:    "Acme Inc",
+    Slug:    "acme",
+    OwnerID: userID,
+})
+```
+
+---
+
+#### Client
+
+See [Create organization](./client/organizations.mdx#create-organization) for the wrapper and form component.
+
+### List your orgs — `GET /auth/orgs`
+
+Auth: any authenticated user. Every org the caller belongs to, any role. Query params, all optional:
+
+| Param | Values | Default | Notes |
+|---|---|---|---|
+| `role` | `owner`, `admin`, `member` | — (no filter) | Narrows to memberships at that role — "the orgs I own". Anything else is a **400**, not a silent fallback; see the callout below. |
+| `search` | any string | — (no filter) | Substring match on org name. |
+| `orderBy` | `name`, `created_at`, `member_count` | `name` | Unrecognized values silently fall back to the default rather than erroring. |
+| `orderDirection` | `asc`, `desc` | `asc` | Same fallback behavior. |
+| `offset` | integer | `0` | |
+| `limit` | integer | `20` | **Omit entirely** for the default page of 20. **`limit=0`** explicitly means unlimited — every org the caller belongs to, in one response. Any other value is capped at `100`. This distinction only exists because the param was left off vs. sent as `0` — see the callout below. |
+
+<Callout type="warn" title="An unrecognized role is a 400 — an unrecognized orderBy isn't">
+  The two look like the same kind of param and are deliberately handled differently, here and on every org listing on this page (members, invites, and the admin equivalents).
+
+  A bad `orderBy` falls back to the default because a wrong sort order is cosmetic and immediately visible on screen. A bad `role` is rejected because a filter that silently widens returns rows the caller explicitly asked to exclude — `?role=Owner` (capital O, straight out of a dropdown label) would hand back *every* member, and a console rendering them under the heading it filtered by would be confidently wrong with no error anywhere. An empty `role=` still means "no filter", so a `<select>` bound directly to the query param works unchanged.
+
+  The service layer already treats a role this way on every mutation input; as of v0.2.2 the filters agree with it.
+</Callout>
+
+<Callout type="info" title="Why limit=0 means something different from omitting it">
+  `ListUserOrgsInput.Limit` is `*int`, not `int`, specifically so the service can tell "the caller didn't say" (`nil` → default 20) apart from "the caller explicitly wants everything" (`&0` → unlimited). A plain `int` can't make that distinction — Go's zero value is `0` either way. The HTTP handler mirrors this by checking whether the `limit` query param is *present*, not just parsing it: an absent or unparsable `limit` becomes `nil`, `limit=0` becomes a pointer to `0`. The same semantics apply to [members](#list-members--get-authorgsorgidmembers) and [invites](#listing-invites--get-authorgsorgidinvites) below — but not to the admin `GET /admin/users` listing, which has no unlimited escape hatch.
+</Callout>
 
 ```json
 {
-  "email": "invitee@example.com",
-  "role": "member"
+  "orgs": [
+    {
+      "id": "b3b12...",
+      "name": "Acme Inc",
+      "slug": "acme",
+      "memberCount": 5,
+      "createdAt": "2026-01-15T10:30:00Z"
+    }
+  ],
+  "limit": 20,
+  "offset": 0
 }
 ```
 
-The invitee receives an email with a link to accept the invitation. Invitations expire after `InviteTTL`.
+The list response carries no total. Fetch it from `GET /auth/orgs/count` — the count of orgs matching `search` (ignoring `limit`/`offset`), which is what you paginate against, not `orgs.length`. Splitting it out keeps `List` from running a `COUNT(*)` on every page.
 
-## Accepting invitations
+---
 
-Users accept invitations via `POST /auth/org/accept-invite`:
+#### curl
+
+```bash
+curl "https://api.myapp.com/auth/orgs?search=acme&orderBy=created_at&orderDirection=desc&limit=20&offset=0" \
+  -b cookies.txt -c cookies.txt
+
+curl "https://api.myapp.com/auth/orgs/count?search=acme" -b cookies.txt -c cookies.txt
+# → { "count": 1 }
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+result, err := auth.Services.Org.ListUserOrgs(ctx, goauth.ListUserOrgsInput{
+    UserID: userID, Offset: 0, Limit: nil, // nil = default 20; &0 = unlimited
+    OrderBy: "created_at", OrderDirection: "desc",
+})
+// result.Orgs, result.Limit, result.Offset
+
+n, err := auth.Services.Org.CountUserOrgs(ctx, goauth.ListUserOrgsInput{
+    UserID: userID, Search: &search,
+})
+```
+
+`Role` is a `*domain.OrgRole` — leave it `nil` for every role, or point it at one to narrow the list to memberships at that role:
+
+```go
+role := domain.OrgRoleOwner
+owned, err := auth.Services.Org.ListUserOrgs(ctx, goauth.ListUserOrgsInput{
+    UserID: userID, Role: &role,
+})
+```
+
+---
+
+#### Client
+
+See [List organizations](./client/organizations.mdx#list-organizations) for the wrapper and data table.
+
+### Get one org — `GET /auth/orgs/{orgID}`
+
+Auth: org member. Same response shape as create.
+
+| Code | Status | Cause |
+|---|---|---|
+| `org_not_found` | 404 | Doesn't exist |
+| `org_member_not_found` | 404 | Exists, but the caller isn't a member — same status either way, so membership can't be probed |
+
+---
+
+#### curl
+
+```bash
+curl https://api.myapp.com/auth/orgs/a1b2... -b cookies.txt -c cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+org, err := auth.Services.Org.GetByID(ctx, goauth.GetOrgInput{OrgID: orgID, ActorID: callerUserID})
+```
+
+---
+
+#### Client
+
+See [Get organization](./client/organizations.mdx#get-organization) for the wrapper.
+
+## Updating and deleting orgs
+
+### Update an org — `PUT /auth/orgs/{orgID}`
+
+Auth: org admin or above. Body: `{ "name"?, "slug"? }`. Both fields are pointers, so omitting one leaves it unchanged rather than clearing it. Unlike `WithRegistration`, this is a partial update.
+
+```json
+```json
+{
+  "id": "b3b12...",
+  "name": "Acme Incorporated",
+  "slug": "acme",
+  "memberCount": 5,
+  "createdAt": "2026-01-15T10:30:00Z"
+}
+```
+```
+
+| Code | Status | Cause |
+|---|---|---|
+| `org_not_found` | 404 | Doesn't exist |
+| `org_slug_reserved` | 400 | New `slug` is a reserved word |
+| `org_slug_exists` | 409 | New `slug` is already taken by another org |
+
+---
+
+#### curl
+
+```bash
+curl -X PUT https://api.myapp.com/auth/orgs/a1b2... \
+  -H "Content-Type: application/json" \
+  -H "Origin: https://myapp.com" \
+  -b cookies.txt -c cookies.txt \
+  -d '{"name":"Acme Incorporated"}'
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+newName := "Acme Incorporated"
+org, err := auth.Services.Org.UpdateOrg(ctx, goauth.UpdateOrgInput{
+    OrgID: orgID,
+    Name:  &newName, // nil Slug leaves the slug unchanged
+})
+```
+
+---
+
+#### Client
+
+See [Update organization](./client/organizations.mdx#update-organization) for the wrapper and form component.
+
+### Delete an org — `DELETE /auth/orgs/{orgID}`
+
+Auth: org owner. Deletes the org outright — no soft-delete. Every member's `activeOrgId` pointing at it is cleared first (their sessions survive; they're just no longer scoped to a now-gone org).
+
+```json
+{ "message": "Organization deleted" }
+```
+
+The only error beyond the standard auth ones is `org_not_found` (404).
+
+---
+
+#### curl
+
+```bash
+curl -X DELETE https://api.myapp.com/auth/orgs/a1b2... \
+  -H "Origin: https://myapp.com" \
+  -b cookies.txt -c cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+err := auth.Services.Org.DeleteOrg(ctx, goauth.DeleteOrgInput{OrgID: orgID, ActorID: callerUserID})
+```
+
+---
+
+#### Client
+
+See [Delete organization](./client/organizations.mdx#delete-organization) for the wrapper and confirmation dialog.
+
+## Members
+
+### List members — `GET /auth/orgs/{orgID}/members`
+
+Auth: org member. Query params, all optional:
+
+| Param | Values | Default | Notes |
+|---|---|---|---|
+| `role` | `owner`, `admin`, `member` | — (no filter) | Anything else is a **400** — see the callout under [List your orgs](#list-your-orgs--get-authorgs). |
+| `search` | any string | — (no filter) | Substring match on the member's name or email. |
+| `orderBy` | `joined_at`, `role`, `name`, `email` | `joined_at` | Unrecognized values fall back to the default. |
+| `orderDirection` | `asc`, `desc` | `asc` | Same fallback behavior. |
+| `offset` | integer | `0` | |
+| `limit` | integer | `20` | Omit for the default page of 20. **`limit=0`** is explicit unlimited — every member of the org, in one response. Other values are capped at `100`. See the `limit=0` callout under [List your orgs](#list-your-orgs--get-authorgs) — same semantics here. |
 
 ```json
 {
-  "token": "invite-token"
+  "members": [
+    {
+      "orgId": "a1b2...",
+      "userId": "b3f1...",
+      "role": "owner",
+      "joinedAt": "2026-08-01T09:00:00Z",
+      "user": { "...": "the full domain.User for this member" }
+    }
+  ],
+  "limit": 20,
+  "offset": 0
 }
 ```
 
-## Managing members
+The total lives at `GET /auth/orgs/{orgID}/members/count` (accepts `role` and `search`, ignores pagination) so the list doesn't run a `COUNT(*)` per page.
 
-- `GET /auth/org/:id/members` — list all members
-- `PUT /auth/org/:id/members/:userId/role` — change a member's role
-- `DELETE /auth/org/:id/members/:userId` — remove a member
+---
 
-## Organization audit logs
+#### curl
 
-Organization-scoped audit events are stored in the `organization_audit_logs` table. These are separate from the global audit logs and track organization-specific actions.
+```bash
+curl "https://api.myapp.com/auth/orgs/a1b2.../members?role=admin&search=jane&orderBy=name&orderDirection=asc&offset=0&limit=20" \
+  -b cookies.txt -c cookies.txt
+
+curl "https://api.myapp.com/auth/orgs/a1b2.../members/count?role=admin&search=jane" \
+  -b cookies.txt -c cookies.txt
+# → { "count": 1 }
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+result, err := auth.Services.Org.ListMembers(ctx, goauth.ListMembersInput{
+    OrgID: orgID, ActorID: callerUserID, Offset: 0, Limit: nil, // nil = default 20; &0 = unlimited
+    OrderBy: "name", OrderDirection: "asc",
+})
+// result.Members, result.Limit, result.Offset
+
+n, err := auth.Services.Org.CountMembers(ctx, goauth.ListMembersInput{
+    OrgID: orgID, ActorID: callerUserID, Role: &role, Search: &search,
+})
+```
+
+---
+
+#### Client
+
+See [List members](./client/organizations.mdx#list-members) for the wrapper and data table.
+
+### Remove a member, or leave — `DELETE /auth/orgs/{orgID}/members/{userID}`, `POST /auth/orgs/{orgID}/leave`
+
+Two routes, one underlying operation: `LeaveOrg` is literally `RemoveMember` with your own ID — leaving is just removing yourself. Removing someone else requires org admin; leaving only requires being a member (you can always remove yourself).
+
+```json
+{ "message": "Member removed" }
+```
+
+or, from `/leave`:
+
+```json
+{ "message": "Left organization" }
+```
+
+| Code | Status | Cause |
+|---|---|---|
+| `org_member_not_found` | 404 | That user isn't a member |
+| `cannot_remove_last_owner` | 400 | Target is the org's only Owner — removing (or leaving as) the last Owner is blocked so an org can never end up with zero owners |
+
+---
+
+#### curl
+
+```bash
+# Remove someone else (admin+)
+curl -X DELETE https://api.myapp.com/auth/orgs/a1b2.../members/b3f1... \
+  -H "Origin: https://myapp.com" -b cookies.txt -c cookies.txt
+
+# Leave it yourself
+curl -X POST https://api.myapp.com/auth/orgs/a1b2.../leave \
+  -H "Origin: https://myapp.com" -b cookies.txt -c cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+err := auth.Services.Org.RemoveMember(ctx, goauth.RemoveMemberInput{
+    OrgID: orgID, UserID: targetUserID, ActorID: callerUserID,
+})
+// leaving is the same call with your own ID as UserID (the actor is you):
+err = auth.Services.Org.LeaveOrg(ctx, goauth.LeaveOrgInput{OrgID: orgID, UserID: callerUserID})
+```
+
+---
+
+#### Client
+
+See [Remove member](./client/organizations.mdx#remove-member) and [Leave organization](./client/organizations.mdx#leave-organization) for the wrapper and confirmation dialogs.
+
+### Change a member's role — `PATCH /auth/orgs/{orgID}/members/{userID}/role`
+
+Auth: org admin — except granting or revoking `owner`, which requires the caller to already be an Owner (see the [Roles](#roles) callout above). Body: `{ "role" }`.
+
+```json
+{ "message": "Role updated" }
+```
+
+| Code | Status | Cause |
+|---|---|---|
+| `invalid_role` | 400 | `role` isn't `owner`/`admin`/`member` |
+| `org_member_not_found` | 404 | Target isn't a member |
+| `org_forbidden` | 403 | Caller is an Admin (not Owner) trying to grant or revoke `owner` |
+| `cannot_remove_last_owner` | 400 | Target is the sole Owner and the new role isn't `owner` |
+
+---
+
+#### curl
+
+```bash
+curl -X PATCH https://api.myapp.com/auth/orgs/a1b2.../members/b3f1.../role \
+  -H "Content-Type: application/json" \
+  -H "Origin: https://myapp.com" \
+  -b cookies.txt -c cookies.txt \
+  -d '{"role":"admin"}'
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+err := auth.Services.Org.UpdateMemberRole(ctx, goauth.UpdateMemberRoleInput{
+    OrgID:   orgID,
+    UserID:  targetUserID,
+    NewRole: domain.OrgRoleAdmin,
+    ActorID: callerUserID, // whose own membership gets checked for the Owner-only rule above
+})
+```
+
+---
+
+#### Client
+
+See [Change member role](./client/organizations.mdx#change-member-role) for the wrapper and role select component.
+
+## Active org
+
+A session can be scoped to one org at a time — stored as `sessions.active_org_id`/`active_org_role` (see [Schemas → sessions](../schemas.mdx#sessions)), returned on every session-listing response from [Sessions](./sessions.mdx#listing-sessions). Your app reads it to decide which org's data the current request should see.
+
+### Tenant-safe application handlers
+
+For routes that query tenant-owned application data, use `RequireActiveOrgScope`. It authenticates the request, checks that the session has an active organization with at least the required role, and invokes the handler with a non-empty `goauth.OrgScope` only after those checks succeed:
+
+```go
+type ProjectStore struct {
+    db *sql.DB
+}
+
+func (s *ProjectStore) Get(ctx context.Context, scope goauth.OrgScope, projectID string) (*Project, error) {
+    const query = `
+        SELECT id, name
+        FROM projects
+        WHERE org_id = $1 AND id = $2`
+
+    var project Project
+    err := s.db.QueryRowContext(ctx, query, scope.OrgID, projectID).
+        Scan(&project.ID, &project.Name)
+    return &project, err
+}
+
+func getProject(w http.ResponseWriter, r *http.Request, scope goauth.OrgScope) {
+    project, err := projects.Get(r.Context(), scope, r.PathValue("projectID"))
+    // handle err and encode project
+}
+
+mux.Handle(
+    "GET /projects/{projectID}",
+    auth.CORS(auth.RequireActiveOrgScope(domain.OrgRoleMember, getProject)),
+)
+```
+
+`RequireActiveOrgScope` includes `RequireAuth`; do not wrap it a second time. It returns `no_active_org` (400) if the session has no active org and `org_forbidden` (403) if its role is below the required role. For a route that names the tenant in an `{orgID}` path segment, use `RequireOrgScope` with the same handler signature instead.
+
+<Callout type="warning" title="Org authorization does not rewrite your SQL">
+  `OrgScope` makes the tenant binding an explicit handler and repository argument, but go-auth cannot inject `org_id` into queries issued by your application. Every read, update, and delete of tenant-owned data must include `scope.OrgID` in its predicate. Filtering only by a caller-controlled resource ID can expose another tenant's row, even when this middleware authorized the request itself.
+</Callout>
+
+The lower-level `RequireActiveOrg(role)` and `RequireOrg(role)` middleware remain available when a conventional `http.Handler` is required. Wrap them inside `RequireAuth`, then read the resolved tenant with `middleware.GetOrgID(ctx)` and `middleware.GetOrgRole(ctx)`. They perform the same authentication and role checks, but recovering the org from context is easier to forget than accepting `OrgScope` directly, so prefer the scoped variants for tenant-owned data routes.
+
+An explicit `{orgID}` and the session's active organization are independent selections and can legitimately differ. `RequireOrgScope` authorizes the path organization; `RequireActiveOrgScope` authorizes the active organization stored on the session. Choose one source for a route and use the resulting `scope.OrgID` all the way through its repository calls.
+
+**From a browser client**, there's no dedicated "what's my active org" endpoint — `/auth/me` returns the user, not the session. The active org is visible on the [session-listing](./sessions.mdx#listing-sessions) responses (match `currentSessionId` against the `sessions` array to find your own), but the simplest approach is usually to just track it as local state the moment you call `setActive`/`clearActive` below, rather than re-fetching to confirm it.
+
+### Set active org — `PUT /auth/orgs/active`
+
+Auth: any authenticated user. Body: `{ "orgId" }`. No `{orgID}` path segment — membership is checked inside the service, not by `RequireOrgMember` middleware.
+
+```json
+{ "message": "Active org updated" }
+```
+
+The only error beyond the standard auth ones is `org_member_not_found` (404) — you can't activate an org you don't belong to.
+
+---
+
+#### curl
+
+```bash
+curl -X PUT https://api.myapp.com/auth/orgs/active \
+  -H "Content-Type: application/json" \
+  -H "Origin: https://myapp.com" \
+  -b cookies.txt -c cookies.txt \
+  -d '{"orgId":"a1b2..."}'
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+err := auth.Services.Org.SetActiveOrg(ctx, goauth.SetActiveOrgInput{SessionID: sessionID, UserID: userID, OrgID: orgID})
+```
+
+---
+
+#### Client
+
+See [Set active organization](./client/organizations.mdx#set-active-organization) for the wrapper and org switcher component.
+
+### Clear active org — `DELETE /auth/orgs/active`
+
+Auth: any authenticated user. No body.
+
+```json
+{ "message": "Active org cleared" }
+```
+
+---
+
+#### curl
+
+```bash
+curl -X DELETE https://api.myapp.com/auth/orgs/active \
+  -H "Origin: https://myapp.com" -b cookies.txt -c cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+err := auth.Services.Org.ClearActiveOrg(ctx, goauth.ClearActiveOrgInput{SessionID: sessionID})
+```
+
+---
+
+#### Client
+
+The client has no dedicated clear-active wrapper — call the endpoint directly (see [Setup](./client/index.mdx)).
+
+## Invites
+
+Email-based, code-authenticated, and matched by email on accept — the accepting account's email must equal the invite's, so an invite can't be redeemed by whoever happens to have the link.
+
+### Creating an invite — `POST /auth/orgs/{orgID}/invites`
+
+Auth: org admin — except inviting someone directly as `owner`, which requires the caller to already be an Owner, mirroring [Change a member's role](#change-a-members-role--patch-authorgsorgidmembersuseridrole). Body: `{ "email", "role" }`. Requires a mailer (`WithMailer`/`WithEmail`) — same requirement as [email verification](./authentication.mdx#verifying-the-email); without one, this fails outright rather than silently skipping delivery.
+
+```json
+{
+  "id": "c4d5...",
+  "orgId": "a1b2...",
+  "email": "new-hire@example.com",
+  "role": "member",
+  "rawCode": "the-raw-code",
+  "invitedBy": "b3f1...",
+  "expiresAt": "2026-08-16T12:00:00Z",
+  "createdAt": "2026-08-09T12:00:00Z"
+}
+```
+
+`rawCode` only appears here, on creation — [List invites](#listing-invites--get-authorgsorgidinvites) omits it, since by then it's only useful to whoever received the email.
+
+| Code | Status | Cause |
+|---|---|---|
+| `invalid_role` | 400 | `role` isn't `owner`/`admin`/`member` |
+| `org_forbidden` | 403 | Caller is an Admin (not Owner) inviting as `owner` |
+| `email_failed` | 500 | Invite row was created, but sending the email failed |
+| `internal_error` | 500 | `InviteTTL` isn't configured (`WithOrganizations` wasn't set up with a positive `InviteTTL`) |
+
+---
+
+#### curl
+
+```bash
+curl -X POST https://api.myapp.com/auth/orgs/a1b2.../invites \
+  -H "Content-Type: application/json" \
+  -H "Origin: https://myapp.com" \
+  -b cookies.txt -c cookies.txt \
+  -d '{"email":"new-hire@example.com","role":"member"}'
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+invite, err := auth.Services.OrgInvite.CreateOrgInvite(ctx, goauth.CreateOrgInviteInput{
+    OrgID:     orgID,
+    Email:     "new-hire@example.com",
+    Role:      domain.OrgRoleMember,
+    InvitedBy: callerUserID,
+})
+```
+
+---
+
+#### Client
+
+See [Create invite](./client/organizations.mdx#create-invite) for the wrapper and invite form component.
+
+### Accepting an invite — `POST /auth/orgs/invites/accept`
+
+Auth: any authenticated user — the invited person has to already have (or just have created) an account; this only adds them to the org. Body: `{ "code" }`. No `{orgID}` segment — the org comes from the code itself.
+
+```json
+{ "message": "Invite accepted" }
+```
+
+| Code | Status | Cause |
+|---|---|---|
+| `invalid_code` | 400 | `code` was empty |
+| `org_invite_expired` | 400 | Code doesn't match any invite, or matches one that's already been claimed or has expired — all three collapse to this one code |
+| `org_invite_email_mismatch` | 400 | The authenticated caller's email doesn't match the invite's — log in (or sign up) as the invited address first |
+
+---
+
+#### curl
+
+```bash
+curl -X POST https://api.myapp.com/auth/orgs/invites/accept \
+  -H "Content-Type: application/json" \
+  -H "Origin: https://myapp.com" \
+  -b cookies.txt -c cookies.txt \
+  -d '{"code":"the-raw-code"}'
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+err := auth.Services.OrgInvite.AcceptInvite(ctx, goauth.AcceptInviteInput{
+    UserID:  callerUserID,
+    RawCode: code,
+})
+```
+
+---
+
+#### Client
+
+See [Accept invite](./client/organizations.mdx#accept-invite) for the wrapper and accept form component.
+
+### Listing invites — `GET /auth/orgs/{orgID}/invites`
+
+Auth: org admin. `rawCode` is never present here (see [Creating an invite](#creating-an-invite--post-authorgsorgidinvites)). Query params, all optional:
+
+| Param | Values | Default | Notes |
+|---|---|---|---|
+| `role` | `owner`, `admin`, `member` | — (no filter) | The role the invite grants on acceptance, not the caller's own role. Anything else is a **400**, as on every org listing. |
+| `status` | `pending`, `expired` | — (both) | Derived from `expiresAt` vs. the current time — there's no stored status column. A claimed invite's row is deleted outright, so it never shows up here as anything. |
+| `search` | any string | — (no filter) | Substring match on the invited email. |
+| `orderBy` | `created_at`, `expires_at`, `email`, `role` | `created_at` | Unrecognized values fall back to the default. |
+| `orderDirection` | `asc`, `desc` | `desc` | Note the default direction here is `desc` (newest first), unlike orgs/members above — matches the previous fixed ordering. |
+| `offset` | integer | `0` | |
+| `limit` | integer | `20` | Omit for the default page of 20. **`limit=0`** is explicit unlimited — every invite for the org, in one response. Other values are capped at `100`. See the `limit=0` callout under [List your orgs](#list-your-orgs--get-authorgs) — same semantics here. |
+
+```json
+{
+  "invites": [
+    {
+      "id": "inv_abc...",
+      "email": "new-hire@example.com",
+      "role": "member",
+      "status": "pending",
+      "expiresAt": "2026-01-22T10:30:00Z",
+      "createdAt": "2026-01-15T10:30:00Z"
+    }
+  ],
+  "limit": 20,
+  "offset": 0
+}
+```
+
+The total lives at `GET /auth/orgs/{orgID}/invites/count` (accepts `role`, `status`, `search`; ignores pagination) so the list doesn't run a `COUNT(*)` per page.
+
+---
+
+#### curl
+
+```bash
+curl "https://api.myapp.com/auth/orgs/a1b2.../invites?status=pending&search=new-hire&orderBy=created_at&orderDirection=desc&offset=0&limit=20" \
+  -b cookies.txt -c cookies.txt
+
+curl "https://api.myapp.com/auth/orgs/a1b2.../invites/count?status=pending&search=new-hire" \
+  -b cookies.txt -c cookies.txt
+# → { "count": 1 }
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+result, err := auth.Services.OrgInvite.ListOrgInvites(ctx, goauth.ListOrgInvitesInput{
+    OrgID: orgID, ActorID: callerUserID, Offset: 0, Limit: nil, // nil = default 20; &0 = unlimited
+    Status: statusPtr("pending"), OrderBy: "created_at", OrderDirection: "desc",
+})
+// result.Invites, result.Limit, result.Offset
+
+n, err := auth.Services.OrgInvite.CountOrgInvites(ctx, goauth.ListOrgInvitesInput{
+    OrgID: orgID, ActorID: callerUserID, Status: statusPtr("pending"),
+})
+```
+
+---
+
+#### Client
+
+See [List invites](./client/organizations.mdx#list-invites) for the wrapper and data table.
+
+### Resending or deleting an invite — `POST .../invites/{inviteID}/resend`, `DELETE .../invites/{inviteID}`
+
+Auth: org admin for both. `orgID` in the path is only used for the membership/role check — the handler looks up the invite by `inviteID` alone, so it isn't re-validated against `orgID` a second time inside the handler itself.
+
+```json
+{ "message": "Invite email resent" }
+```
+
+or:
+
+```json
+{ "message": "Invite deleted" }
+```
+
+Delete here is a hard delete of the invite record — distinct from revoking a self-service signup invite (see [Routes → Invites](../routes/auth.mdx#get-invite-info)), which is a different feature with its own soft-cancel semantics.
+
+---
+
+#### curl
+
+```bash
+curl -X POST https://api.myapp.com/auth/orgs/a1b2.../invites/c4d5.../resend \
+  -H "Origin: https://myapp.com" -b cookies.txt -c cookies.txt
+
+curl -X DELETE https://api.myapp.com/auth/orgs/a1b2.../invites/c4d5... \
+  -H "Origin: https://myapp.com" -b cookies.txt -c cookies.txt
+```
+
+---
+
+#### Programmatic (Go)
+
+```go
+err := auth.Services.OrgInvite.ResendOrgInviteEmail(ctx, inviteID)
+err = auth.Services.OrgInvite.DeleteOrgInvite(ctx, inviteID)
+```
+
+---
+
+#### Client
+
+See [Resend invite](./client/organizations.mdx#resend-invite) and [Delete invite](./client/organizations.mdx#delete-invite) for the wrapper and confirmation dialogs.
 
 ## Next
 
-- [Configuration](../configuration.mdx) — `WithOrganizations`
-- [Schemas](../schemas.mdx) — organization database tables
+- [Routes](../routes/orgs.mdx) — the full path/param table for every route on this page
+- [Schemas](../schemas.mdx#organizations) — the `organizations`, `organization_members`, and `organization_invites` tables
+- [Authentication](./authentication.mdx) — the mailer requirement invites share with email verification
+- [Sessions](./sessions.mdx#listing-sessions) — where `activeOrgId`/`activeOrgRole` show up on a session

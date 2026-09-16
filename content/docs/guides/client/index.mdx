@@ -1,86 +1,97 @@
 ---
-title: "Client Integration"
-description: "How to integrate go-auth from a frontend or mobile app."
-icon: "Smartphone"
+title: "Setup"
+description: "The fetch wrapper every client-side example in these guides is built on: cookies, CSRF, and error handling."
+icon: "Plug"
 ---
 
-# Client Integration
+# Client
 
-go-auth provides an HTTP API that frontend and mobile applications can use directly. This guide covers how to integrate with the go-auth API from any HTTP client.
+Every **Client** section across the guides — and every named method on the wrapped clients in this folder (`authApi`, and whatever gets added alongside future guides) — is built on one small `fetch` wrapper. It's defined once here rather than repeated in every guide.
 
-## Overview
+It has to do two things a plain `fetch` call doesn't: send cookies on every request, and attach the CSRF header on every state-changing request. Both are mandatory — the double-submit token layer is on by default, so a `POST` without the header is a `403` before it reaches a handler.
 
-The go-auth HTTP API is a standard REST API that returns JSON. It uses:
-
-- **Session cookies** for authentication (`_session` for users, `_admin_session` for admins)
-- **CSRF double-submit cookies** for state-changing requests (`_csrf`)
-- **Bearer tokens** as an alternative to cookies (for API-only clients)
-
-## Getting started
-
-1. **Fetch a CSRF token** — `GET /auth/csrf-token`
-2. **Login** — `POST /auth/login` with email and password
-3. **Use the session** — Include the session cookie in subsequent requests
-
-## CSRF protection
-
-All state-changing requests require a CSRF token. The flow:
-
-1. `GET /auth/csrf-token` — sets the `_csrf` cookie and returns the token value (when `ExposeCSRFTokenInBody` is true).
-2. Include the token in the `X-CSRF-Token` header on state-changing requests.
-
-For same-origin deployments, the cookie is automatically sent and readable by JavaScript. For cross-origin deployments, see [Deployment](../deployment.mdx).
-
-## Session cookies vs bearer tokens
-
-**Session cookies** are the recommended approach for browser-based apps:
-
-- Automatically managed by the browser
-- Secure, HttpOnly, SameSite=Lax by default
-- No client-side token storage needed
-
-**Bearer tokens** are suitable for API-only clients:
-
-- Include the token in the `Authorization: Bearer <token>` header
-- Store securely on the client
-- Manage refresh manually
-
-## 2FA flow
-
-When 2FA is required:
-
-1. `POST /auth/login` returns `pending_2fa: true` and a short-lived session token.
-2. User receives a code by email.
-3. `POST /auth/2fa/verify` with the code completes authentication.
-4. `GET /auth/me` returns `active: true` when fully authenticated.
-
-## Example: fetch API
-
-```javascript
-// Login
-const response = await fetch('/auth/login', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ email: 'user@example.com', password: 'password' }),
-  credentials: 'include' // important: sends and receives cookies
-});
-
-const data = await response.json();
-if (data.pending_2fa) {
-  // Redirect to 2FA verification
-} else {
-  // Login successful
+```ts
+function getCookie(name: string): string | null {
+  const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
-// Authenticated request
-const meResponse = await fetch('/auth/me', {
-  credentials: 'include'
-});
-const meData = await meResponse.json();
+async function getCSRFToken(baseUrl: string): Promise<string | null> {
+  const cookieToken = getCookie("_csrf");
+  if (cookieToken) return cookieToken;
+
+  const res = await fetch(`${baseUrl}/auth/csrf-token`, {
+    method: "GET",
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error("Could not initialize CSRF protection");
+
+  // Same-origin and sibling-subdomain deployments receive 204 and can read
+  // the cookie. Different registrable domains receive { token } instead.
+  if (res.status === 204) return getCookie("_csrf");
+  const payload: { token?: unknown } = await res.json();
+  return typeof payload.token === "string" ? payload.token : null;
+}
+
+let onUnauthorized: (() => void) | null = null;
+
+// Called from the Provider guide: lets the rest of the app react the moment
+// any request comes back 401 or banned, instead of only the one call that hit it.
+export function setUnauthorizedHandler(handler: () => void) {
+  onUnauthorized = handler;
+}
+
+export async function apiRequest(baseUrl: string, method: string, path: string, body?: unknown) {
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+
+  if (method !== "GET") {
+    const csrf = await getCSRFToken(baseUrl);
+    if (csrf) headers["X-CSRF-Token"] = csrf;
+  }
+
+  const res = await fetch(`${baseUrl}${path}`, {
+    method,
+    credentials: "include",                  // required — this is how the session cookie gets sent and stored
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    if (res.status === 401 || (res.status === 403 && err.error === "user_banned")) {
+      onUnauthorized?.();
+    }
+    if (res.status === 429) {
+      err.retryAfter = Number(res.headers.get("Retry-After")) || undefined;
+    }
+    throw err;
+  }
+
+  return res.status === 204 ? undefined : res.json();
+}
 ```
+
+`credentials: "include"` makes the browser send and store the `HttpOnly` session and refresh cookies. `_csrf` and `X-CSRF-Token` are the defaults; both are configurable on `CSRFTokenConfig` (see [Configuration → WithSecurity](../../configuration.mdx#withsecurity-required-allowedorigins)). `getCSRFToken` reads the cookie for same-origin and sibling-subdomain deployments, and reads the `{ "token": "..." }` body for different registrable domains. In the latter topology it calls `/auth/csrf-token` before each mutation, so it also picks up rotations that JavaScript cannot observe through `document.cookie`.
+
+Leaving `CSRFToken` `nil` server-side does **not** disable the layer; the server creates the default configuration. With `DisableCSRFToken: true`, `getCSRFToken` returns `null` and the wrapper sends no CSRF header.
+
+Use `setUnauthorizedHandler` to clear stale client state when any request finds that a session was revoked, banned, or expired. The [Provider](./auth-provider.mdx) wires it to clear the app-wide user state on `401` or `403 user_banned`.
+
+On a `429`, the thrown error also carries `retryAfter`: the `Retry-After` header value in seconds.
+
+## What lives where
+
+- The individual feature guides (e.g. [Authentication](../authentication.mdx)) show the **raw** call — `apiRequest(API_BASE, "POST", "/auth/login", ...)` — right next to the curl and Go examples for that same endpoint, so you can see the request/response map 1:1 to what's documented above it.
+- [Authentication](./authentication.mdx), [Sessions](./sessions.mdx), [Organizations](./organizations.mdx), [Security](./security.mdx), [OAuth linking](./oauth.mdx), and [Admin](./admin.mdx) wrap those same calls into named methods — `authApi.login(...)`, `sessionsApi.list(...)`, `orgApi.create(...)`, `securityApi.changePassword(...)`, `oauthApi.link(...)`, `adminApi.listUsers(...)` — the form you'd actually want in an app.
+- [Provider](./auth-provider.mdx) wraps *those* in a React context, so components read `user`/`loading` from one hook instead of calling the API directly.
+- [Middleware](./middleware.mdx) is a different layer entirely — it runs on the server, before any of the above, to redirect unauthenticated requests away from protected pages.
 
 ## Next
 
-- [Authentication](./authentication.mdx) — login and registration flows
-- [Middleware](./middleware.mdx) — session validation middleware
-- [Admin](./admin.mdx) — admin client integration
+- [Authentication client](./authentication.mdx) — `authApi`, covering register, login, logout, and session checks
+- [Sessions client](./sessions.mdx) — `sessionsApi`, covering listing and revoking
+- [Organizations client](./organizations.mdx) — `orgApi`, covering org CRUD, membership, and invites
+- [Security client](./security.mdx) — `securityApi`, covering name/password changes, verification resend, and deletion
+- [OAuth linking client](./oauth.mdx) — `oauthApi`, covering link/unlink/list connected providers
+- [Admin client](./admin.mdx) — `adminApi`, covering user management and audit-log queries

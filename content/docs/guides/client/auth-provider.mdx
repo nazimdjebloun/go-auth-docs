@@ -1,0 +1,206 @@
+---
+title: "Auth Provider"
+description: "A React context built on authApi that turns the raw client into app-wide user/loading state, with an auto-signout when a session dies elsewhere."
+icon: "Component"
+---
+
+# Auth Provider
+
+`authApi` and `sessionsApi` are request helpers. This React context keeps user and loading state in one `<AuthProvider>` and exposes it through `useAuth()`.
+
+```tsx
+"use client";
+
+import {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  type ReactNode,
+} from "react";
+import { authApi } from "./authApi";
+import { setUnauthorizedHandler } from "./client";
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  isVerified: boolean;
+  hasPassword: boolean;
+}
+
+interface AuthOutcome {
+  requiresVerification?: boolean;
+  requiresTwoFactor?: boolean;
+  challengeId?: string;
+  expiresAt?: string;
+  codeSent?: boolean;
+  message?: string;
+}
+
+interface AuthContextValue {
+  user: User | null;
+  loading: boolean;
+  error: string | null;
+  refresh: () => Promise<void>;
+  login: (input: { email: string; password: string }) => Promise<AuthOutcome>;
+  register: (input: { email: string; password: string; name: string }) => Promise<AuthOutcome>;
+  verifyTwoFactor: (challengeId: string, code: string) => Promise<void>;
+  resendTwoFactor: (challengeId: string) => Promise<void>;
+  logout: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextValue | null>(null);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setUser(await authApi.me());
+      setError(null);
+    } catch {
+      setUser(null); // 401 here just means "not logged in", not a bug
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => setUser(null));
+    refresh();
+  }, [refresh]);
+
+  const login = useCallback(async (input: { email: string; password: string }) => {
+    setError(null);
+    try {
+      const result = await authApi.login(input);
+      if (result.requiresVerification || result.requiresTwoFactor) return result;
+      await refresh();
+      return {};
+    } catch (err: any) {
+      setError(err.message ?? err.error);
+      throw err;
+    }
+  }, [refresh]);
+
+  const register = useCallback(async (input: { email: string; password: string; name: string }) => {
+    setError(null);
+    try {
+      const result = await authApi.register(input);
+      if (result.requiresVerification || result.requiresTwoFactor) return result;
+      await refresh();
+      return {};
+    } catch (err: any) {
+      setError(err.message ?? err.error);
+      throw err;
+    }
+  }, [refresh]);
+
+  const verifyTwoFactor = useCallback(async (challengeId: string, code: string) => {
+    setError(null);
+    try {
+      await authApi.verifyTwoFactor(challengeId, code);
+      await refresh();
+    } catch (err: any) {
+      setError(err.message ?? err.error);
+      throw err;
+    }
+  }, [refresh]);
+
+  const resendTwoFactor = useCallback(async (challengeId: string) => {
+    setError(null);
+    try {
+      await authApi.resendTwoFactor(challengeId);
+    } catch (err: any) {
+      setError(err.message ?? err.error);
+      throw err;
+    }
+  }, []);
+
+  const logout = useCallback(async () => {
+    setError(null);
+    try {
+      await authApi.logout();
+      setUser(null);
+      if (typeof window !== "undefined") window.location.href = "/login";
+    } catch (err: any) {
+      setError(err.message ?? err.error);
+      throw err;
+    }
+  }, []);
+
+  return (
+    <AuthContext.Provider value={{ user, loading, error, refresh, login, register, verifyTwoFactor, resendTwoFactor, logout }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth(): AuthContextValue {
+  const ctx = useContext(AuthContext);
+  if (!ctx) {
+    throw new Error("useAuth must be used within an AuthProvider");
+  }
+  return ctx;
+}
+```
+
+## How the provider works
+
+**Mount-time `refresh()`.** `useEffect(() => { refresh() }, [])` calls `GET /auth/me` once to hydrate `user` from an existing `goauth_session` cookie.
+
+**`loading` starts as `true`.** Before the first `refresh()` resolves, the client has not determined whether a user exists. Gate route rendering on `loading === false`, not only on `user` being non-null.
+
+**`setUnauthorizedHandler(() => setUser(null))`.** This clears app-wide user state when any request receives `401` or `403 user_banned` for a revoked, banned, or expired session.
+
+**Gated login and registration.** A response with `requiresVerification` or `requiresTwoFactor` does not create a session, so `login` and `register` return that response without calling `refresh()`. Store `challengeId` while showing a 2FA prompt, then call `verifyTwoFactor`; only a successful verification refreshes `user`.
+
+**Why `login`/`register` call `refresh()` after a session is issued.** This keeps `refresh()` as the one code path that populates `user`, at the cost of one request.
+
+## Using it
+
+Mount once, near the root:
+
+```tsx
+// app/layout.tsx
+import { AuthProvider } from "./auth-provider";
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html>
+      <body>
+        <AuthProvider>{children}</AuthProvider>
+      </body>
+    </html>
+  );
+}
+```
+
+Then anywhere below it:
+
+```tsx
+function AccountMenu() {
+  const { user, loading, logout } = useAuth();
+
+  if (loading) return <Skeleton />;
+  if (!user) return <a href="/login">Log in</a>;
+
+  return (
+    <div>
+      {user.name}
+      <button onClick={logout}>Log out</button>
+    </div>
+  );
+}
+```
+
+## Next
+
+- [Setup](./index.mdx) — the `apiRequest` helper and `setUnauthorizedHandler` this is built on
+- [Authentication client](./authentication.mdx) — `authApi`, including `me` and two-factor methods
+- [Middleware](./middleware.mdx) — the server-side counterpart: redirecting unauthenticated requests before a page even renders

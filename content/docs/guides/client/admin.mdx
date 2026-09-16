@@ -1,64 +1,301 @@
 ---
-title: "Admin Client"
-description: "Admin client integration for user and session management."
-icon: "ShieldCheck"
+title: "Admin"
+description: "adminApi — user management, audit-log queries, and platform invites for an admin dashboard, built on the apiRequest helper."
+icon: "UserCog"
 ---
 
-# Admin Client
+# Admin client
 
-The admin client integration follows the same patterns as the user client, but uses separate admin sessions and routes.
+`adminApi` covers common dashboard operations from the [Admin](../admin.mdx) and [Audit Logs](../audit-logs.mdx) guides. Add any remaining admin route with the same [`apiRequest`](./index.mdx) helper. The `login` method is public; every `/admin/*` method requires a logged-in user with `role: "admin"`.
 
-## Admin login
+```ts
+import { apiRequest } from "./client";
 
-Admin login uses `POST /auth/admin/login` with a separate session scope:
+const API_BASE = "https://api.myapp.com";
 
-```javascript
-const response = await fetch('/auth/admin/login', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ email: 'admin@example.com', password: 'password' }),
-  credentials: 'include'
-});
+export const adminApi = {
+  login: (email: string, password: string) =>
+    apiRequest(API_BASE, "POST", "/auth/admin/login", { email, password }),
 
-const data = await response.json();
-if (data.pending_2fa) {
-  // Admin 2FA verification required
-} else {
-  // Admin login successful
+  listUsers: (params: Record<string, string | number> = {}) =>
+    apiRequest(API_BASE, "GET", `/admin/users?${new URLSearchParams(params as Record<string, string>)}`),
+
+  // The list response has no `total`. Fetch the count separately, keyed on
+  // the filter params only (drop offset/limit) so paging doesn't re-run it.
+  countUsers: (params: Record<string, string | number> = {}) =>
+    apiRequest(API_BASE, "GET", `/admin/users/count?${new URLSearchParams(params as Record<string, string>)}`),
+
+  getUser: (userId: string) => apiRequest(API_BASE, "GET", `/admin/users/${userId}`),
+
+  createUser: (input: { email: string; password: string; name: string; role?: "user" | "admin" }) =>
+    apiRequest(API_BASE, "POST", "/admin/users", input),
+
+  updateRole: (userId: string, role: "user" | "admin") =>
+    apiRequest(API_BASE, "PATCH", `/admin/users/${userId}/role`, { role }),
+
+  ban: (userId: string) => apiRequest(API_BASE, "PATCH", `/admin/users/${userId}/ban`),
+
+  unban: (userId: string) => apiRequest(API_BASE, "PATCH", `/admin/users/${userId}/unban`),
+
+  deleteUser: (userId: string) => apiRequest(API_BASE, "DELETE", `/admin/users/${userId}`),
+
+  listUserSessions: (userId: string, offset = 0, limit = 20) =>
+    apiRequest(API_BASE, "GET", `/admin/users/${userId}/sessions?offset=${offset}&limit=${limit}`),
+
+  revokeUserSession: (userId: string, sessionId: string) =>
+    apiRequest(API_BASE, "DELETE", `/admin/users/${userId}/sessions/${sessionId}`),
+
+  revokeUserSessions: (userId: string) =>
+    apiRequest(API_BASE, "DELETE", `/admin/users/${userId}/sessions`),
+
+  // --- Stats and activity ---
+
+  getStats: () => apiRequest(API_BASE, "GET", "/admin/stats"),
+
+  getRegistrationTrend: (from: string, to: string) =>
+    apiRequest(API_BASE, "GET", `/admin/stats/registrations?from=${from}&to=${to}`),
+
+  getLoginActivity: (from: string, to: string, userId?: string) =>
+    apiRequest(
+      API_BASE, "GET",
+      `/admin/stats/logins?from=${from}&to=${to}${userId ? `&userId=${userId}` : ""}`
+    ),
+
+  // --- Audit logs — requires WithAudit(AuditConfig{Enabled: true}) server-side ---
+
+  listAuditLogs: (params: Record<string, string | number> = {}) =>
+    apiRequest(API_BASE, "GET", `/admin/audit-logs?${new URLSearchParams(params as Record<string, string>)}`),
+
+  countAuditLogs: (params: Record<string, string | number> = {}) =>
+    apiRequest(API_BASE, "GET", `/admin/audit-logs/count?${new URLSearchParams(params as Record<string, string>)}`),
+
+  listUserAuditLogs: (userId: string, params: Record<string, string | number> = {}) =>
+    apiRequest(API_BASE, "GET", `/admin/users/${userId}/audit-logs?${new URLSearchParams(params as Record<string, string>)}`),
+
+  countUserAuditLogs: (userId: string, params: Record<string, string | number> = {}) =>
+    apiRequest(API_BASE, "GET", `/admin/users/${userId}/audit-logs/count?${new URLSearchParams(params as Record<string, string>)}`),
+
+  // --- Platform invites — requires RegistrationConfig.EnableInvite ---
+
+  createInvite: (email: string) => apiRequest(API_BASE, "POST", "/admin/invites", { email }),
+
+  listInvites: (params: Record<string, string | number> = {}) =>
+    apiRequest(API_BASE, "GET", `/admin/invites?${new URLSearchParams(params as Record<string, string>)}`),
+
+  countInvites: (params: Record<string, string | number> = {}) =>
+    apiRequest(API_BASE, "GET", `/admin/invites/count?${new URLSearchParams(params as Record<string, string>)}`),
+
+  revokeInvite: (inviteId: string) => apiRequest(API_BASE, "DELETE", `/admin/invites/${inviteId}`),
+
+  resendInvite: (inviteId: string) => apiRequest(API_BASE, "POST", `/admin/invites/${inviteId}/resend`),
+
+  deleteInvite: (inviteId: string) => apiRequest(API_BASE, "DELETE", `/admin/invites/${inviteId}/hard`),
+};
+```
+
+## Using it
+
+```ts
+const { users } = await adminApi.listUsers({ limit: 20, search: "ada" });
+const { count } = await adminApi.countUsers({ search: "ada" }); // total for the pager
+```
+
+```ts
+try {
+  await adminApi.updateRole(userId, "user");
+} catch (err) {
+  // last_admin — see the Admin guide
+  showError(err.message ?? err.error);
 }
 ```
 
-## Admin session cookie
+## Stats and activity
 
-Admin sessions use a separate cookie (`_admin_session`). Include it in subsequent admin requests:
-
-```javascript
-// List all users
-const response = await fetch('/auth/admin/users', {
-  credentials: 'include'
-});
-const users = await response.json();
+```ts
+const stats = await adminApi.getStats();
+const { registrations } = await adminApi.getRegistrationTrend("2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z");
+const { logins } = await adminApi.getLoginActivity("2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z"); // global
+const { logins: userLogins } = await adminApi.getLoginActivity(from, to, userId); // one user's heatmap
 ```
 
-## Admin routes
+## Audit logs
 
-All admin routes require an admin session and appropriate permissions:
+`listAuditLogs()` with no filters returns everything in the audit log, paginated — it's never a 404, even if audit logging was never enabled server-side (that just means the table is empty).
 
-- `POST /auth/admin/login` — admin login
-- `POST /auth/admin/logout` — admin logout
-- `GET /auth/admin/me` — admin profile
-- `GET /auth/admin/users` — list users
-- `POST /auth/admin/create-user` — create user
-- `DELETE /auth/admin/users/:id` — delete user
-- `PUT /auth/admin/users/:id/role` — change user role
-- `POST /auth/admin/reset-user-password` — reset user password
-- `GET /auth/admin/sessions` — list all sessions
-- `DELETE /auth/admin/sessions/:id` — terminate session
-- `POST /auth/admin/sessions/bulk-delete` — terminate multiple sessions
-- `GET /auth/admin/audit/logs` — list audit logs
-- `GET /auth/admin/audit/logs/:id` — get audit log
+```ts
+const { events } = await adminApi.listAuditLogs({ event_type: "login.failed", limit: 50 });
+const { count } = await adminApi.countAuditLogs({ event_type: "login.failed" });
+
+// event_type takes a comma-separated list — matches any of them
+const failures = await adminApi.listAuditLogs({ event_type: "login.failed,login.locked" });
+
+// actorEmail/targetEmail resolve to a user ID server-side — no need to
+// already know the UUID. 404 user_not_found if no user has that email.
+const byActor = await adminApi.listAuditLogs({ actorEmail: "ada@example.com" });
+
+// deviceType filters on the parsed user agent: mobile, desktop, tablet, bot
+const mobileLogins = await adminApi.listAuditLogs({ event_type: "login.success", deviceType: "mobile" });
+```
+
+### Audit logs data table
+
+```tsx
+// components/audit-logs-table.tsx
+"use client";
+
+import { useState, useEffect } from "react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Input } from "@/components/ui/input";
+import { adminApi } from "../lib/api/admin";
+
+interface AuditEvent {
+  id: string;
+  type: string;
+  severity: "info" | "warning" | "error" | "critical";
+  success: boolean;
+  actorId: string | null;
+  actorEmail: string | null;
+  targetUserId: string | null;
+  targetEmail: string | null;
+  ip: string | null;
+  userAgent: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
+export function AuditLogsTable() {
+  const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [filters, setFilters] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const limit = 25;
+
+  useEffect(() => { loadEvents(); }, [offset, filters]);
+
+  async function loadEvents() {
+    setLoading(true);
+    setError(null);
+    try {
+      const params = { ...filters, limit, offset };
+      const result = await adminApi.listAuditLogs(params);
+      setEvents(result.events);
+      const countResult = await adminApi.countAuditLogs(filters);
+      setTotal(countResult.count);
+    } catch (err: any) {
+      setError(err.message ?? err.error);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function severityVariant(severity: string) {
+    if (severity === "critical") return "destructive";
+    if (severity === "error") return "destructive";
+    if (severity === "warning") return "secondary";
+    return "outline";
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Audit log ({total})</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {error && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+        <div className="flex flex-wrap gap-2">
+          <Input
+            placeholder="Search events, IP, user agent..."
+            className="flex-1 min-w-[200px]"
+            onChange={(e) => { setFilters({ ...filters, search: e.target.value }); setOffset(0); }}
+          />
+          <Input
+            placeholder="Event type (e.g. login.failed)"
+            className="w-48"
+            onChange={(e) => { setFilters({ ...filters, event_type: e.target.value }); setOffset(0); }}
+          />
+          <Input
+            placeholder="Actor email"
+            className="w-48"
+            onChange={(e) => { setFilters({ ...filters, actorEmail: e.target.value }); setOffset(0); }}
+          />
+        </div>
+        {loading ? (
+          <p className="text-sm text-muted-foreground">Loading...</p>
+        ) : events.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No audit events match these filters.</p>
+        ) : (
+          <div className="space-y-2">
+            {events.map((event) => (
+              <div key={event.id} className="flex items-center justify-between rounded-md border p-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <p className="font-medium truncate">{event.type}</p>
+                    <Badge variant={event.success ? "outline" : "destructive"}>
+                      {event.success ? "Success" : "Failed"}
+                    </Badge>
+                    {event.severity !== "info" && (
+                      <Badge variant={severity variant(event.severity)}>
+                        {event.severity}
+                      </Badge>
+                    )}
+                  </div>
+                  <p className="text-sm text-muted-foreground truncate">
+                    {event.actorEmail ?? event.actorId ?? "—"}
+                    {event.targetEmail ? ` → ${event.targetEmail}` : ""}
+                    {event.ip ? ` · ${event.ip}` : ""}
+                    {` · ${new Date(event.createdAt).toLocaleString()}`}
+                  </p>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex justify-between">
+          <Button variant="outline" size="sm" disabled={offset === 0} onClick={() => setOffset(offset - limit)}>
+            Previous
+          </Button>
+          <span className="text-sm text-muted-foreground">
+            {offset + 1}–{Math.min(offset + limit, total)} of {total}
+          </span>
+          <Button variant="outline" size="sm" disabled={offset + limit >= total} onClick={() => setOffset(offset + limit)}>
+            Next
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+```
+
+### Per-user audit logs
+
+For a user detail page, scope the query to one user:
+
+```ts
+const { events } = await adminApi.listUserAuditLogs(userId, { event_type: "login.failed" });
+const { count } = await adminApi.countUserAuditLogs(userId);
+```
+
+## Platform invites
+
+```ts
+const invite = await adminApi.createInvite("ada@example.com");
+const { invites } = await adminApi.listInvites({ status: "pending" });
+const { count } = await adminApi.countInvites({ status: "pending" });
+await adminApi.resendInvite(invite.id); // issues a fresh code, invalidates the old one
+```
 
 ## Next
 
-- [Client integration](./index.mdx) — overview
-- [Admin guide](../admin.mdx) — admin setup and configuration
+- [Setup](./index.mdx) — the `apiRequest` helper this is built on
+- [Admin](../admin.mdx) — full request/response/error reference
+- [Audit Logs](../audit-logs.mdx) — event types and filter params
