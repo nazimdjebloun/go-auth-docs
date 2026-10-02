@@ -75,12 +75,14 @@ Full reference for both, including how they interact with everything else: [Conf
 
 ## Writing your own login handler
 
-`a.Services.Auth.Login` (and `Register`) return raw tokens — no cookies are set, since the service layer never touches `net/http`. If you're writing a custom handler (a different response shape, extra steps before the session is issued) instead of using the built-in `a.Handlers.Login`, use these three methods to reproduce the exact cookie behavior the built-in handlers use:
+`a.Services().Auth.Login` (and `Register`) return raw tokens — no cookies are set, since the service layer never touches `net/http`. If you're writing a custom handler (a different response shape, extra steps before the session is issued) instead of using the built-in handler from `a.Handler("POST /auth/login")`, use these three methods to reproduce the exact cookie behavior the built-in handlers use:
+
+Import `github.com/nazimdjebloun/go-auth/api` for `api.LoginInput` in this example.
 
 ```go
 func myLoginHandler(a *goauth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		result, err := a.Services.Auth.Login(r.Context(), goauth.LoginInput{
+		result, err := a.Services().Auth.Login(r.Context(), api.LoginInput{
 			Email:    r.FormValue("email"),
 			Password: r.FormValue("password"),
 		})
@@ -98,7 +100,7 @@ func myLoginHandler(a *goauth.Auth) http.HandlerFunc {
 ```
 
 - `SetSessionCookies(w, sessionToken, refreshToken)` writes both cookies using the configured `CookieConfig`/`SessionConfig` settings. Pass `""` for `refreshToken` to skip the refresh cookie — the same guard the built-in handlers use.
-- `ClearSessionCookies(w)` expires both cookies — in a custom logout handler, call it only after `a.Services.Session.Revoke` succeeds. A revocation error means the server-side session may still be valid and must be returned to the client instead of presenting a false-success logout.
+- `ClearSessionCookies(w)` expires both cookies — in a custom logout handler, call it only after `a.Services().Session.Revoke` succeeds. A revocation error means the server-side session may still be valid and must be returned to the client instead of presenting a false-success logout.
 - `RotateCSRFToken(w)` issues a fresh CSRF token cookie. It's a separate call, not bundled into `SetSessionCookies`, because CSRF rotation is also needed on flows that don't touch cookies at all (e.g. password change) — keeping them separate means one method does one thing. It's a no-op if `SecurityConfig.DisableCSRFToken` is set.
 
 ## Frontend client setup
@@ -124,6 +126,8 @@ curl https://api.myapp.com/auth/sessions -b cookies.txt -c cookies.txt
 ```
 
 `AuthMiddleware` transparently rotates your session when the session cookie has expired but the refresh cookie is still valid — it issues new `Set-Cookie` headers on that same response rather than erroring. If you only ever read from the jar (`-b`) and never let curl write back to it (`-c`), you keep replaying the old token, and once the refresh window closes too you'll get a `401 session_expired` that looks like it came from nowhere. Always pass both flags pointing at the same file.
+
+**Backend failures are not expired credentials.** Session-validation or refresh backend failures return `500 internal_error`; the protected handler does not run. If rotation succeeds but the following user lookup fails, the response includes the new cookies even with the 500. Keep accepting `Set-Cookie` on error responses and do not clear credentials merely because the API returns a 500. A canceled connection may prevent the client from receiving either the response or its cookies.
 
 **2. The revoke endpoints also need the `Origin` header.** `DELETE /auth/sessions/{id}`, `POST /auth/sessions/revoke`, and `DELETE /auth/sessions` are state-changing, so they run through the same `OriginCheck` as register/login — see [Authentication → Origin checking](./authentication.mdx#origin-checking). The two list endpoints and `GET /auth/me` are `GET` requests and don't need it; `OriginCheck` only inspects `POST`/`PUT`/`PATCH`/`DELETE`.
 
@@ -195,7 +199,7 @@ Which fields you actually get:
 | `revokedAt` | Never on this endpoint; see `isRevoked` above. |
 
 <Callout type="info" title="One session shape, everywhere">
-  `session` is `domain.Session` verbatim, minus the three `json:"-"` token hashes. It is the same object `POST /auth/login`, `POST /auth/register`, `POST /auth/invite/register`, `POST /auth/2fa/verify`, `POST /auth/verify-email` and `POST /auth/refresh` all return under that key. Read the fields you need and ignore the rest: a field added to the struct appears on every one of them at once.
+  `session` is `domain.Session` verbatim, minus the three `json:"-"` token hashes. It is the same object `POST /auth/login`, `POST /auth/register`, `POST /auth/invite/register`, `POST /auth/2fa/verify` and `POST /auth/refresh` all return under that key. Read the fields you need and ignore the rest: a field added to the struct appears on every one of them at once.
 </Callout>
 
 | Code | Status | Cause |
@@ -269,7 +273,7 @@ curl -X POST https://api.myapp.com/auth/refresh \
 #### Programmatic (Go)
 
 ```go
-result, err := auth.Services.Session.Refresh(ctx, refreshToken)
+result, err := auth.Services().Session.RefreshSession(ctx, refreshToken)
 // result.SessionToken / result.RefreshToken are the raw values — set them as cookies yourself
 ```
 
@@ -338,7 +342,7 @@ curl "https://api.myapp.com/auth/sessions?offset=0&limit=20" -b cookies.txt -c c
 #### Programmatic (Go)
 
 ```go
-sessions, total, err := auth.Services.Session.List(ctx, userID, 0, 20)
+sessions, total, err := auth.Services().Session.List(ctx, userID, 0, 20)
 ```
 
 ---
@@ -383,7 +387,7 @@ curl https://api.myapp.com/auth/sessions/all -b cookies.txt -c cookies.txt
 #### Programmatic (Go)
 
 ```go
-sessions, err := auth.Services.Session.ListAll(ctx, userID)
+sessions, err := auth.Services().Session.ListAll(ctx, userID)
 ```
 
 ---
@@ -428,7 +432,7 @@ curl -X DELETE https://api.myapp.com/auth/sessions/9e2c... \
 #### Programmatic (Go)
 
 ```go
-revoked, err := auth.Services.Session.RevokeByIDForUser(ctx, sessionID, userID)
+revoked, err := auth.Services().Session.RevokeByIDForUser(ctx, sessionID, userID)
 if err == nil && !revoked {
     // treat as session_not_found — it existed but wasn't this user's, or didn't exist at all
 }
@@ -479,7 +483,7 @@ curl -X POST https://api.myapp.com/auth/sessions/revoke \
 #### Programmatic (Go)
 
 ```go
-revoked, err := auth.Services.Session.RevokeManyForUser(ctx, []string{"9e2c...", "a71f..."}, userID)
+revoked, err := auth.Services().Session.RevokeManyForUser(ctx, []string{"9e2c...", "a71f..."}, userID)
 ```
 
 ---
@@ -521,9 +525,9 @@ curl -X DELETE https://api.myapp.com/auth/sessions \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Session.RevokeAllExcept(ctx, userID, currentSessionID)
+err := auth.Services().Session.RevokeAllExcept(ctx, userID, currentSessionID)
 // or, if you don't have a "current" session to preserve:
-err := auth.Services.Session.RevokeAll(ctx, userID)
+err := auth.Services().Session.RevokeAll(ctx, userID)
 ```
 
 ---

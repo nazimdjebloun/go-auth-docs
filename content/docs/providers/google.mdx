@@ -35,6 +35,8 @@ The authorization request always includes `access_type=online` (no refresh token
 
 ## Email handling
 
+The adapter rejects non-2xx userinfo responses and missing or blank `id` values. Invalid profiles fail with `provider_error`; they cannot create, link, or authenticate an identity.
+
 Google's userinfo endpoint returns `verified_email` directly, and the provider passes it through as-is — no fallback logic like GitHub's, since Google always reports verification status on the primary profile.
 
 ## Frontend client setup
@@ -68,11 +70,12 @@ No `Origin` header needed — this is a `GET` with no state-changing effect, so 
 #### Programmatic (Go)
 
 ```go
-url, err := auth.Services.OAuth.Initiate(ctx, "google")
+flow, err := auth.Services().OAuth.Initiate(ctx, "google")
 if err != nil {
     // wraps a *domain.AuthError — provider_not_found if the name is wrong
 }
-// redirect the browser to url
+// Bind flow.State to the initiating browser as the HTTP handler does,
+// then redirect the browser to flow.URL.
 ```
 
 ---
@@ -88,7 +91,9 @@ window.location.href = url;
 
 ### The callback — `GET`/`POST /auth/oauth/google/callback`
 
-Google redirects here itself — your frontend never calls this URL directly. On success it sets session cookies and redirects the browser to `{BaseURL}/auth/callback`; on failure, to `{BaseURL}/auth/callback?error={code}&provider=google`. Your frontend route at `{BaseURL}/auth/callback` reads that query string to know whether to show the app or an error.
+Admin accounts stop for email 2FA by default. Handle `requiresTwoFactor=true`, `challengeId`, and `expiresAt` on the landing URL and finish through `POST /auth/2fa/verify` before treating the user as logged in. See [Callback outcomes](../routes/oauth.mdx#callback).
+
+Google redirects here itself — your frontend never calls this URL directly. On completed login it sets session cookies and redirects the browser to `{BaseURL}/auth/callback`; on failure, to `{BaseURL}/auth/callback?error={code}&provider=google`. Your frontend route at `{BaseURL}/auth/callback` reads that query string to know whether to show the app or an error.
 
 See [Routes](../routes/oauth.mdx) for the full parameter reference, [Error Handling](../error-handling.mdx#oauth) for every error this can redirect back with, and [Guides → OAuth linking](../guides/oauth.mdx) for connecting Google to an account that's already logged in (a different flow from the sign-in one above).
 

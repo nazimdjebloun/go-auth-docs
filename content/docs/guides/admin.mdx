@@ -6,13 +6,15 @@ icon: "ShieldUser"
 
 # Admin
 
-Everything here requires `role: "admin"` on the calling user — routes are wrapped in `RequireRole(domain.RoleAdmin, nil)` on top of the normal `AuthMiddleware`, so an expired or missing session fails the same way it does everywhere else, and a valid session with `role: "user"` gets `403 forbidden`.
+Everything here requires the calling user's current `role: "admin"` and a session that completed 2FA by default. Normal authentication runs first: a missing or expired session fails as usual, a non-admin gets `403 forbidden`, and an admin session without second-factor assurance gets `403 two_factor_required`. Sign in again and finish the challenge to recover access. `Auth.RequireAdmin` applies the same policy to your own routes.
+
+One distinction that applies to every admin route: `user_not_found` (404) is returned only when the target user genuinely does not exist. If the database read for the target user fails instead — an outage, a canceled context — the route answers `internal_error` (500) and logs the cause server-side, so a temporary backend problem is never reported as a missing user. The same rule covers the middleware: session validation or transparent-refresh failures due to backend trouble produce `internal_error`, never `401 unauthorized` — see [Error handling](../error-handling.mdx#general).
 
 For the full path/param reference see [Routes](../routes/admin.mdx#user-management). For viewing what admins (and everyone else) have done, see [Audit Logs](./audit-logs.mdx).
 
 ## Configuration
 
-There's no `WithAdmin` flag — these routes are always mounted. What gates them is purely the `role` column on `domain.User`, which is either `"user"` or `"admin"`.
+There's no `WithAdmin` flag — these routes are always mounted. Access checks the `role` column on `domain.User` and the session's second-factor assurance. `TwoFactorConfig.DisableAdminTwoFactor` opts out of the default admin requirement; global and per-user requirements still apply.
 
 <Callout type="warn" title="Bootstrapping the first admin">
   Every admin-management endpoint below requires an admin session to call — including `POST /admin/users`. That's a chicken-and-egg problem for the very first admin: there's no API route that creates one from nothing. Use the `goauth seed-admin` CLI command — see [Creating the first admin](#creating-the-first-admin) below.
@@ -38,7 +40,7 @@ That email is fixed HTML-and-text content with no app name, links, or configurab
 |---|---|---|---|
 | Admin email | — | `ADMIN_EMAIL` | Prompted for interactively if unset and stdin is a TTY; a hard error otherwise. |
 | Admin password | — | `ADMIN_PASSWORD` | Validated against the default password policy if set. Otherwise prompted (hidden input) with fallback to a strong auto-generated password, printed once and never shown again. |
-| SMTP config | `--smtp-host`, `--smtp-port`, `--smtp-from`, `--smtp-user`, `--smtp-pass`, `--smtp-tls` | `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_USER`, `SMTP_PASS`, `SMTP_TLS` | Required unless `--env dev` (see below) or `--skip-mailer-check`. |
+| SMTP config | `--smtp-host`, `--smtp-port`, `--smtp-from`, `--smtp-user`, `--smtp-pass`, `--smtp-tls` | `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `SMTP_USER`, `SMTP_PASS`, `SMTP_TLS` | Required unless `--env dev` (see below) or `--skip-mailer-check`. The port defaults to 587; an explicit flag overrides `SMTP_PORT`. Invalid or out-of-range ports fail before seeding. |
 | Force non-interactive | `--non-interactive` | — | Missing `ADMIN_EMAIL` fails immediately instead of prompting — for CI. |
 | Skip the mailer send | `--skip-mailer-check` | — | Still builds a mailer if SMTP config is present; just doesn't require the send to succeed. Prints a loud warning either way. |
 | Allow a second admin | `--force` | — | Without it, seeding refuses outright if any `role: admin` row already exists. |
@@ -70,7 +72,7 @@ Same request shape as [Login](./authentication.mdx#login), but only succeeds for
 | `password` | `string` | Required |
 
 <Callout type="warn" title="Admin login requires a second factor by default">
-  `POST /auth/admin/login` sends a 2FA challenge regardless of `RequireEmail2FA` and the account's `TwoFactorEnabled` setting. It therefore requires a mailer unless `TwoFactorConfig.DisableAdminTwoFactor` is set. Disabling it reduces protection for the highest-privilege login path. See [Configuration](../configuration.mdx#withmailer--withemail--withtemplates-required-unless-every-email-feature-is-off) and [Security](../security.mdx#two-factor-authentication).
+  `POST /auth/admin/login` sends a 2FA challenge regardless of `RequireEmail2FA` and the account's `TwoFactorEnabled` setting. It therefore requires a mailer unless `TwoFactorConfig.DisableAdminTwoFactor` is set. The same default applies to ordinary admin password login, admin OAuth login, and privileged HTTP access. Global/per-user requirements still apply when the admin default is disabled. See [Configuration](../configuration.mdx#withmailer--withemail--withtemplates-required-unless-every-email-feature-is-off) and [Security](../security.mdx#two-factor-authentication).
 </Callout>
 
 **Response** (`200 OK`) — never a session directly. A correct admin password returns a gated challenge, the same shape [Login](./authentication.mdx#login) uses:
@@ -122,8 +124,10 @@ Use a separate cookie jar from your regular user session while testing — the v
 
 #### Programmatic (Go)
 
+Go examples on this page import `github.com/nazimdjebloun/go-auth/api` for operation inputs and results.
+
 ```go
-result, err := auth.Services.Auth.AdminLogin(ctx, goauth.LoginInput{
+result, err := auth.Services().Auth.AdminLogin(ctx, api.LoginInput{
     Email:     "root@myapp.com",
     Password:  "a very strong admin password 1",
     IP:        r.RemoteAddr,
@@ -135,7 +139,7 @@ if err != nil {
 // result.RequiresTwoFactor is always true here — result.TwoFactorChallenge is
 // the challenge id, result.BindingToken() is what the handler sets as a cookie.
 
-verified, err := auth.Services.TwoFactor.Verify(
+verified, err := auth.Services().TwoFactor.Verify(
     ctx, result.TwoFactorChallenge, result.BindingToken(), code, r.RemoteAddr, r.UserAgent(),
 )
 if err != nil {
@@ -182,8 +186,8 @@ setAdminUser(verified.user); // cookies are already set
 | `twoFactorEnabled` | bool | — | `true` or `false` — anything else is ignored, not applied as a filter |
 | `neverLoggedIn` | bool | — | `true` only — `last_login_at IS NULL`. Registered but never logged in since. |
 | `lastLoginBefore` | RFC3339 timestamp | — | `last_login_at < X`, excluding users who've never logged in (that's `neverLoggedIn`'s job) — "logged in before, gone dormant since." Composable with `neverLoggedIn` for two different questions in one dashboard. |
-| `orderBy` | string | `created_at` | Or `updated_at` — anything else falls back to the default |
-| `orderDirection` | string | `desc` | Or `asc` — anything else falls back to the default |
+| `orderBy` | string | `created_at` | Or `updated_at`; an explicitly supplied unsupported value is a **400** |
+| `orderDirection` | string | `desc` | Or `asc`; an explicitly supplied unsupported value is a **400** |
 
 **Response** (`200 OK`)
 
@@ -222,9 +226,11 @@ curl "https://api.myapp.com/admin/users?limit=20&search=ada&role=user" \
 #### Programmatic (Go)
 
 ```go
-result, err := auth.Services.Admin.ListUsers(ctx, goauth.AdminListUsersInput{
-    Limit:  20,
-    Search: goauth.String("ada"),
+search := "ada"
+result, err := auth.Services().Admin.ListUsers(ctx, api.AdminListUsersInput{
+    ActorID: adminID,
+    Limit:   20,
+    Search:  &search,
 })
 // result.Users
 ```
@@ -243,7 +249,7 @@ const { users } = await apiRequest(API_BASE, "GET", "/admin/users?limit=20&searc
 
 The matching total for [List users](#list-users--get-adminusers), split into its own call: `List` no longer runs a `COUNT(*)` on every page, so a paginated table fetches the count once per filter change instead of once per page.
 
-**Query params**: the filter params of [List users](#list-users--get-adminusers) (`email`, `search`, `role`, `isBanned`, `isVerified`, `twoFactorEnabled`, `neverLoggedIn`, `lastLoginBefore`). `offset`, `limit`, `orderBy`, `orderDirection` are accepted but ignored.
+**Query params**: the filter params of [List users](#list-users--get-adminusers) (`email`, `search`, `role`, `isBanned`, `isVerified`, `twoFactorEnabled`, `neverLoggedIn`, `lastLoginBefore`). `offset` and `limit` are ignored. `orderBy` and `orderDirection` are also ignored after validation: omitted values use the list defaults, and explicitly unsupported values return `400 invalid_input`.
 
 **Response** (`200 OK`): `{ "count": 150 }`
 
@@ -258,8 +264,10 @@ curl "https://api.myapp.com/admin/users/count?role=user&isBanned=true" \
 #### Programmatic (Go)
 
 ```go
-n, err := auth.Services.Admin.CountUsers(ctx, goauth.AdminListUsersInput{
-    Role: &roleUser,
+roleUser := domain.RoleUser
+n, err := auth.Services().Admin.CountUsers(ctx, api.AdminListUsersInput{
+    ActorID: adminID,
+    Role:    &roleUser,
 })
 ```
 
@@ -307,7 +315,7 @@ curl https://api.myapp.com/admin/users/b3f1... \
 #### Programmatic (Go)
 
 ```go
-detail, err := auth.Services.Admin.GetUserDetail(ctx, goauth.GetUserDetailInput{
+detail, err := auth.Services().Admin.GetUserDetail(ctx, api.GetUserDetailInput{
     UserID:  userID,
     ActorID: adminID, // the admin making this call
 })
@@ -366,7 +374,8 @@ curl -X POST https://api.myapp.com/admin/users \
 #### Programmatic (Go)
 
 ```go
-user, err := auth.Services.Admin.CreateUser(ctx, goauth.CreateUserInput{
+user, err := auth.Services().Admin.CreateUser(ctx, api.CreateUserInput{
+    ActorID:  adminID,
     Email:    "newadmin@myapp.com",
     Password: "a very strong password 1",
     Name:     "New Admin",
@@ -422,7 +431,7 @@ curl -X PATCH https://api.myapp.com/admin/users/b3f1.../role \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Admin.UpdateUserRole(ctx, goauth.UpdateUserRoleInput{
+err := auth.Services().Admin.UpdateUserRole(ctx, api.UpdateUserRoleInput{
     UserID:  userID,
     Role:    "admin",
     ActorID: adminID, // the admin making this call
@@ -467,8 +476,8 @@ curl -X PATCH https://api.myapp.com/admin/users/b3f1.../ban \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Admin.BanUser(ctx, goauth.BanUserInput{UserID: userID, ActorID: adminID})
-err  = auth.Services.Admin.UnbanUser(ctx, goauth.UnbanUserInput{UserID: userID, ActorID: adminID})
+err := auth.Services().Admin.BanUser(ctx, api.BanUserInput{UserID: userID, ActorID: adminID})
+err  = auth.Services().Admin.UnbanUser(ctx, api.UnbanUserInput{UserID: userID, ActorID: adminID})
 ```
 
 ---
@@ -507,7 +516,7 @@ curl -X DELETE https://api.myapp.com/admin/users/b3f1... \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Admin.DeleteUser(ctx, goauth.DeleteUserInput{UserID: userID, ActorID: adminID})
+err := auth.Services().Admin.DeleteUser(ctx, api.DeleteUserInput{UserID: userID, ActorID: adminID})
 ```
 
 ---
@@ -543,7 +552,7 @@ curl "https://api.myapp.com/admin/users/b3f1.../sessions?limit=20" \
 #### Programmatic (Go)
 
 ```go
-sessions, total, err := auth.Services.Admin.ListUserSessions(ctx, goauth.AdminListUserSessionsInput{
+sessions, total, err := auth.Services().Admin.ListUserSessions(ctx, api.AdminListUserSessionsInput{
     ActorID: adminID, // the admin making this call
     UserID:  userID,
     Limit:   20,
@@ -586,10 +595,10 @@ curl -X DELETE https://api.myapp.com/admin/users/b3f1.../sessions \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Admin.RevokeUserSession(ctx, goauth.RevokeUserSessionInput{
+err := auth.Services().Admin.RevokeUserSession(ctx, api.RevokeUserSessionInput{
     UserID: userID, SessionID: sessionID, ActorID: adminID,
 })
-err  = auth.Services.Admin.RevokeUserSessions(ctx, goauth.RevokeUserSessionsInput{
+err  = auth.Services().Admin.RevokeUserSessions(ctx, api.RevokeUserSessionsInput{
     UserID: userID, ActorID: adminID,
 }) // all of them
 ```
@@ -627,7 +636,7 @@ curl "https://api.myapp.com/admin/sessions?ip=203.0.113.9" \
 
 ```go
 ip := "203.0.113.9"
-result, err := auth.Services.Admin.ListSessions(ctx, goauth.AdminListSessionsInput{
+result, err := auth.Services().Admin.ListSessions(ctx, api.AdminListSessionsInput{
     ActorID: adminID,
     IP:      &ip,
     Limit:   20,
@@ -646,12 +655,12 @@ const { sessions } = await apiRequest(API_BASE, "GET", "/admin/sessions?ip=203.0
 
 ### Count sessions — `GET /admin/sessions/count`
 
-Total for the filter above, on its own call (same rationale as [Count users](#count-users--get-adminuserscount)). Takes every filter param of `GET /admin/sessions` except `offset`/`limit`/`orderBy`/`orderDirection`.
+Total for the filter above, on its own call (same rationale as [Count users](#count-users--get-adminuserscount)). Takes every filter param of `GET /admin/sessions`; `offset`/`limit` are ignored, and `orderBy`/`orderDirection` are validated then ignored.
 
 **Response**: `{ "count": 5 }`
 
 ```go
-n, err := auth.Services.Admin.CountSessions(ctx, goauth.AdminListSessionsInput{
+n, err := auth.Services().Admin.CountSessions(ctx, api.AdminListSessionsInput{
     ActorID: adminID, IP: &ip,
 })
 ```
@@ -687,7 +696,7 @@ curl -X POST https://api.myapp.com/admin/users/bulk/ban \
 #### Programmatic (Go)
 
 ```go
-result, err := auth.Services.Admin.BulkBanUsers(ctx, goauth.BulkUserActionInput{
+result, err := auth.Services().Admin.BulkBanUsers(ctx, api.BulkUserActionInput{
     UserIDs: []string{"b3f1...", "9e2c..."},
     ActorID: adminID,
 })
@@ -746,7 +755,7 @@ curl https://api.myapp.com/admin/stats -H "Origin: https://myapp.com" -b admin-c
 #### Programmatic (Go)
 
 ```go
-stats, err := auth.Services.Admin.GetStats(ctx, adminID)
+stats, err := auth.Services().Admin.GetStats(ctx, adminID)
 ```
 
 ---
@@ -784,7 +793,7 @@ curl "https://api.myapp.com/admin/stats/registrations?from=2026-07-01T00:00:00Z&
 #### Programmatic (Go)
 
 ```go
-counts, err := auth.Services.Admin.GetRegistrationTrend(ctx, goauth.StatsRangeInput{
+counts, err := auth.Services().Admin.GetRegistrationTrend(ctx, api.StatsRangeInput{
     ActorID: adminID, From: from, To: to,
 })
 ```
@@ -829,11 +838,11 @@ curl "https://api.myapp.com/admin/stats/logins?from=2026-07-01T00:00:00Z&to=2026
 
 ```go
 // Global
-counts, err := auth.Services.Admin.GetLoginActivity(ctx, goauth.LoginActivityInput{
+counts, err := auth.Services().Admin.GetLoginActivity(ctx, api.LoginActivityInput{
     ActorID: adminID, From: from, To: to,
 })
 // One user
-counts, err = auth.Services.Admin.GetLoginActivity(ctx, goauth.LoginActivityInput{
+counts, err = auth.Services().Admin.GetLoginActivity(ctx, api.LoginActivityInput{
     ActorID: adminID, UserID: &userID, From: from, To: to,
 })
 ```
@@ -852,7 +861,7 @@ const { logins } = await apiRequest(
 
 ## Organizations — requires `WithOrganizations`
 
-Platform-admin oversight of organizations: list any org, view one regardless of the caller's own membership in it, and force a mutation an org's own owner/admin couldn't otherwise trigger from outside it. These call `auth.Services.Org` (not `auth.Services.Admin`) — the methods live on `OrgService` because it's only constructed when organizations are enabled, so they simply don't exist (and the routes below aren't mounted) when they're not, the same way every other `/auth/orgs/*` route already works.
+Platform-admin oversight of organizations: list any org, view one regardless of the caller's own membership in it, and force a mutation an org's own owner/admin couldn't otherwise trigger from outside it. These call `auth.Services().Org`. That field is `nil` when organizations are disabled, and the routes below are not mounted.
 
 <Callout type="info" title="Every mutation here publishes its own admin.org.* audit event">
   Distinct from the `organization.*` events the org's own owner/admin would publish for the same action — see [Audit Logs](./audit-logs.mdx) for the full list and why the distinction matters. `admin.org.deleted` also snapshots the org's `name`/`slug` into the event's metadata, since the `organizations` row is hard-deleted and nothing else could resolve `orgId` back to a name afterward.
@@ -877,7 +886,7 @@ curl "https://api.myapp.com/admin/orgs?search=acme" \
 
 ```go
 search := "acme"
-result, err := auth.Services.Org.AdminListOrgs(ctx, goauth.AdminListOrgsInput{
+result, err := auth.Services().Org.AdminListOrgs(ctx, api.AdminListOrgsInput{
     ActorID: adminID,
     Search:  &search,
 })
@@ -895,12 +904,12 @@ const { orgs } = await apiRequest(API_BASE, "GET", "/admin/orgs?search=acme");
 
 ### Count organizations — `GET /admin/orgs/count`
 
-Total for [List organizations](#list-organizations--get-adminorgs), split out for the same reason as [Count users](#count-users--get-adminuserscount). Accepts `search`, `createdAfter`, `createdBefore`; ignores `offset`/`limit`/`orderBy`/`orderDirection`.
+Total for [List organizations](#list-organizations--get-adminorgs), split out for the same reason as [Count users](#count-users--get-adminuserscount). Accepts `search`, `createdAfter`, `createdBefore`; ignores `offset`/`limit`, and validates then ignores `orderBy`/`orderDirection`.
 
 **Response**: `{ "count": 42 }`
 
 ```go
-n, err := auth.Services.Org.CountOrgs(ctx, goauth.AdminListOrgsInput{
+n, err := auth.Services().Org.CountOrgs(ctx, api.AdminListOrgsInput{
     ActorID: adminID, Search: &search,
 })
 ```
@@ -927,7 +936,7 @@ curl https://api.myapp.com/admin/orgs/org-123 \
 #### Programmatic (Go)
 
 ```go
-org, err := auth.Services.Org.AdminGetOrg(ctx, goauth.AdminGetOrgInput{
+org, err := auth.Services().Org.AdminGetOrg(ctx, api.AdminGetOrgInput{
     OrgID: "org-123", ActorID: adminID,
 })
 ```
@@ -958,7 +967,7 @@ curl https://api.myapp.com/admin/orgs/org-123/members \
 #### Programmatic (Go)
 
 ```go
-result, err := auth.Services.Org.AdminListOrgMembers(ctx, goauth.AdminListOrgMembersInput{
+result, err := auth.Services().Org.AdminListOrgMembers(ctx, api.AdminListOrgMembersInput{
     OrgID: "org-123", ActorID: adminID,
 })
 ```
@@ -975,12 +984,12 @@ const { members } = await apiRequest(API_BASE, "GET", "/admin/orgs/org-123/membe
 
 ### Count an organization's members — `GET /admin/orgs/{orgID}/members/count`
 
-Total for the list above. Accepts `role` and `search`; ignores pagination and ordering. Does **not** publish an audit event — it exposes only a number, not member data.
+Total for the list above. Accepts `role` and `search`; ignores pagination and validates then ignores ordering. Does **not** publish an audit event — it exposes only a number, not member data.
 
 **Response**: `{ "count": 12 }`
 
 ```go
-n, err := auth.Services.Org.AdminCountOrgMembers(ctx, goauth.AdminListOrgMembersInput{
+n, err := auth.Services().Org.AdminCountOrgMembers(ctx, api.AdminListOrgMembersInput{
     OrgID: "org-123", ActorID: adminID,
 })
 ```
@@ -1016,7 +1025,7 @@ curl "https://api.myapp.com/admin/users/user-123/orgs?role=owner&orderBy=member_
 
 ```go
 role := domain.OrgRoleOwner
-result, err := auth.Services.Org.AdminListUserOrgs(ctx, goauth.AdminListUserOrgsInput{
+result, err := auth.Services().Org.AdminListUserOrgs(ctx, api.AdminListUserOrgsInput{
     ActorID: adminID, UserID: "user-123", Role: &role,
 })
 // result.Orgs, result.Limit, result.Offset
@@ -1036,12 +1045,12 @@ const { orgs } = await apiRequest(API_BASE, "GET", "/admin/users/user-123/orgs?r
 
 ### Count a user's organizations — `GET /admin/users/{id}/orgs/count`
 
-Total for the list above. Accepts `search` and `role`; ignores pagination and ordering.
+Total for the list above. Accepts `search` and `role`; ignores pagination and validates then ignores ordering.
 
 **Response**: `{ "count": 3 }`
 
 ```go
-n, err := auth.Services.Org.AdminCountUserOrgs(ctx, goauth.AdminListUserOrgsInput{
+n, err := auth.Services().Org.AdminCountUserOrgs(ctx, api.AdminListUserOrgsInput{
     ActorID: adminID, UserID: "user-123",
 })
 ```
@@ -1073,7 +1082,7 @@ curl -X POST https://api.myapp.com/admin/orgs/org-123/members \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Org.AdminAddMember(ctx, goauth.AdminAddMemberInput{
+err := auth.Services().Org.AdminAddMember(ctx, api.AdminAddMemberInput{
     OrgID: "org-123", UserID: "b3f1...", Role: domain.OrgRoleOwner, ActorID: adminID,
 })
 ```
@@ -1108,7 +1117,7 @@ curl -X DELETE https://api.myapp.com/admin/orgs/org-123 \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Org.AdminDeleteOrg(ctx, goauth.AdminOrgActionInput{
+err := auth.Services().Org.AdminDeleteOrg(ctx, api.AdminOrgActionInput{
     OrgID: "org-123", ActorID: adminID,
 })
 ```
@@ -1148,11 +1157,11 @@ curl -X PATCH https://api.myapp.com/admin/orgs/org-123/members/b3f1.../role \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Org.AdminRemoveMember(ctx, goauth.AdminRemoveMemberInput{
+err := auth.Services().Org.AdminRemoveMember(ctx, api.AdminRemoveMemberInput{
     OrgID: "org-123", UserID: "b3f1...", ActorID: adminID,
 })
 
-err = auth.Services.Org.AdminUpdateMemberRole(ctx, goauth.AdminUpdateMemberRoleInput{
+err = auth.Services().Org.AdminUpdateMemberRole(ctx, api.AdminUpdateMemberRoleInput{
     OrgID: "org-123", UserID: "b3f1...", NewRole: domain.OrgRoleOwner, ActorID: adminID,
 })
 ```
@@ -1172,7 +1181,7 @@ await apiRequest(API_BASE, "PATCH", "/admin/orgs/org-123/members/b3f1.../role", 
 
 Admin-issued, invite-only signup: an admin creates an invite for an email address, and the recipient completes registration with it via `POST /auth/invite/register` — covered in [Authentication → Register via invite](./authentication.mdx#register-via-invite--requires-enableinvite-true). This is a different feature from organization invites — see [Organizations → Invites](./organizations.mdx#invites) for those. These routes only exist when `RegistrationConfig.EnableInvite: true`; otherwise they 404.
 
-An invite's `status` is one of `pending`, `accepted`, `revoked`, or `expired` (the last one is set lazily — a pending invite past its `expiresAt` reports `invite_expired` the next time something reads it, rather than a background job flipping the status).
+An invite's `status` is one of `pending`, `accepted`, `revoked`, or `expired`. Admin listings derive `expired` from a pending row's `expiresAt`; token reads report expiry without writing an old snapshot back to the database.
 
 ### Create an invite — `POST /admin/invites`
 
@@ -1218,9 +1227,9 @@ curl -X POST https://api.myapp.com/admin/invites \
 #### Programmatic (Go)
 
 ```go
-invite, err := auth.Services.Invite.CreateInvite(ctx, goauth.CreateInviteInput{
+invite, err := auth.Services().Invite.CreateInvite(ctx, api.CreateInviteInput{
     Email:   "ada@example.com",
-    AdminID: adminUserID,
+    AdminID: adminID,
 })
 ```
 
@@ -1253,9 +1262,10 @@ curl "https://api.myapp.com/admin/invites?status=pending&limit=20" \
 #### Programmatic (Go)
 
 ```go
-invites, err := auth.Services.Invite.ListInvites(ctx, goauth.ListInvitesInput{
-    Status: "pending",
-    Limit:  20,
+invites, err := auth.Services().Invite.ListInvites(ctx, api.ListInvitesInput{
+    ActorID: adminID,
+    Status:  "pending",
+    Limit:   20,
 })
 ```
 
@@ -1276,7 +1286,7 @@ Total for the list, on its own call (same rationale as [Count users](#count-user
 **Response** (`200 OK`): `{ "count": 42 }`
 
 ```go
-n, err := auth.Services.Invite.CountInvites(ctx, goauth.ListInvitesInput{Status: "pending"})
+n, err := auth.Services().Invite.CountInvites(ctx, api.ListInvitesInput{ActorID: adminID, Status: "pending"})
 ```
 
 ```ts
@@ -1304,7 +1314,7 @@ curl -X DELETE https://api.myapp.com/admin/invites/9e2c... \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Invite.RevokeInvite(ctx, inviteID)
+err := auth.Services().Invite.RevokeInvite(ctx, inviteID, adminID)
 ```
 
 ---
@@ -1318,6 +1328,8 @@ await apiRequest(API_BASE, "DELETE", `/admin/invites/${inviteId}`);
 ---
 
 ### Resend an invite — `POST /admin/invites/{id}/resend`
+
+Only pending or expired invites can be resent. Accepted/revoked invites and a lost code-rotation race return `invite_already_used` without sending email. Resend cannot undo revocation or acceptance.
 
 Generates a **new** code and pushes `expiresAt` out by another `InviteTTL` — the previously emailed code stops working once this succeeds, so this is "issue a fresh one," not "re-send the same email."
 
@@ -1343,7 +1355,7 @@ curl -X POST https://api.myapp.com/admin/invites/9e2c.../resend \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Invite.ResendInviteEmail(ctx, inviteID)
+err := auth.Services().Invite.ResendInviteEmail(ctx, inviteID, adminID)
 ```
 
 ---
@@ -1375,7 +1387,7 @@ curl -X DELETE https://api.myapp.com/admin/invites/9e2c.../hard \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Invite.HardDeleteInvite(ctx, inviteID)
+err := auth.Services().Invite.HardDeleteInvite(ctx, inviteID, adminID)
 ```
 
 ---

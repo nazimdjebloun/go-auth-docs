@@ -12,13 +12,20 @@ Requires `RegistrationConfig.EnableOAuth: true` and at least one `WithProvider(.
 
 ## Frontend client setup
 
+Admin sign-in through a linked provider stops for email 2FA by default. The
+landing URL includes `requiresTwoFactor=true`, `challengeId`, and `expiresAt`.
+Show the code-entry screen and submit the challenge and email code to
+`POST /auth/2fa/verify` in the same browser; the callback has already set the
+HttpOnly binding cookie. No session exists until verification succeeds. See
+[OAuth callback outcomes](../routes/oauth.mdx#callback).
+
 The **Client** examples below call the same `apiRequest(baseUrl, method, path, body)` helper used throughout these guides — see [Client → Setup](./client/index.mdx). The named-method wrapper for everything on this page lives on [Client → OAuth](./client/oauth.mdx).
 
 ## Linking a provider
 
 ### Start a link — `POST /auth/oauth/{provider}/link`
 
-Auth required. Returns the provider's authorization URL, same shape as the login-initiate endpoint — redirect the browser to it. The difference is entirely server-side: the state token stores the *current user's ID*, so when the callback fires, `OAuthService.Callback` links to that user instead of creating or logging into a different account.
+Auth required. Returns the provider's authorization URL, same shape as the login-initiate endpoint, and sets a browser state cookie. Redirect that same browser to the URL. The state token stores the current user's ID and initiating session token hash; the callback links only if that exact session is still live.
 
 **Response** (`200 OK`): `{ "url": "https://github.com/login/oauth/authorize?..." }`
 
@@ -44,11 +51,12 @@ The response is JSON, not a redirect — your frontend reads `url` and navigates
 #### Programmatic (Go)
 
 ```go
-url, err := auth.Services.OAuth.InitiateLink(ctx, "github", userID)
+flow, err := auth.Services().OAuth.InitiateLink(ctx, "github", userID, session.TokenHash)
 if err != nil {
     // wraps a *domain.AuthError — provider_not_found if the name is wrong
 }
-// redirect the browser to url
+// Bind flow.State to the initiating browser as the HTTP handler does,
+// then redirect the browser to flow.URL.
 ```
 
 ---
@@ -92,6 +100,7 @@ built in — show the error and point the user at your login form.
 ### Unlink — `POST /auth/oauth/{provider}/unlink`
 
 Auth required. Blocked if this is the account's *only* way to log in — unlinking must never leave an account with no password and no remaining provider.
+Unlink removes **all** identities for the selected provider. Two linked Google identities do not count as a surviving method when unlinking Google: a passwordless account must retain an identity from a different provider.
 
 **Response**: `{ "message": "Provider unlinked" }`
 
@@ -116,7 +125,7 @@ curl -X POST https://api.myapp.com/auth/oauth/github/unlink \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.OAuth.Unlink(ctx, userID, "github")
+err := auth.Services().OAuth.Unlink(ctx, userID, "github")
 ```
 
 ---
@@ -170,7 +179,7 @@ curl https://api.myapp.com/auth/oauth/providers \
 #### Programmatic (Go)
 
 ```go
-accounts, err := auth.Services.OAuth.ListConnected(ctx, userID)
+accounts, err := auth.Services().OAuth.ListConnected(ctx, userID)
 // accounts[i].AccessToken / RefreshToken ARE populated here — this is the
 // internal domain type, not the handler's filtered response shape above.
 // Never send this straight back to a client.

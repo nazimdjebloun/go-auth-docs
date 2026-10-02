@@ -121,8 +121,10 @@ curl -X PUT https://api.myapp.com/auth/password \
 
 #### Programmatic (Go)
 
+Go examples on this page import `github.com/nazimdjebloun/go-auth/api` for operation inputs and results.
+
 ```go
-err := auth.Services.Password.ChangePassword(ctx, goauth.ChangePasswordInput{
+err := auth.Services().Password.ChangePassword(ctx, api.ChangePasswordInput{
     UserID:          userID,
     OldPassword:     "correct horse battery staple 1",
     NewPassword:     "a new stronger passphrase 2",
@@ -173,7 +175,7 @@ curl -X POST https://api.myapp.com/auth/set-password/request \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Password.RequestSetPassword(ctx, userID)
+err := auth.Services().Password.RequestSetPassword(ctx, userID)
 ```
 
 ---
@@ -220,7 +222,7 @@ curl -X POST https://api.myapp.com/auth/set-password/confirm \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Password.ConfirmSetPassword(ctx, goauth.ConfirmSetPasswordInput{
+err := auth.Services().Password.ConfirmSetPassword(ctx, api.ConfirmSetPasswordInput{
     UserID:      "b3f1...",
     Code:        "ABCD1234",
     NewPassword: "a new strong passphrase 2",
@@ -245,10 +247,12 @@ Public flow for a user who's locked out entirely — no session involved on eith
 
 ### Request a reset — `POST /auth/forgot-password`
 
-**Request body**: `{ "email": "..." }`. Always returns the same generic success message, whether or not the account exists.
+**Request body**: `{ "email": "..." }`. With a mailer configured, returns the same generic success message for unknown, passwordless, and password-bearing accounts. Only an account with an existing password receives a reset link; an OAuth-only account must use its provider to sign in before using the set-password flow above.
+
+Valid addresses are durably queued before account lookup. A queue failure returns `internal_error` (`500`) independent of account existence; no mailer returns `email_not_configured`. Token generation, storage, rendering, and delivery run afterward in the background, with retries. Success acknowledges acceptance, not delivery. See [Schemas](../schemas.mdx#recovery_requests) for the required queue table.
 
 <Callout type="info" title="Timing-safe on purpose">
-  When the email doesn't match any account, the handler still runs two dummy token-generation calls before returning — so the response takes roughly the same time either way. Without that, an attacker could tell which emails are registered just by measuring response latency.
+  The public response path performs input validation and the same queue insert for known and unknown valid addresses. It does not wait for account lookup, token generation, template rendering, or SMTP delivery. Missing and passwordless accounts are skipped by the worker.
 </Callout>
 
 #### curl
@@ -265,7 +269,7 @@ curl -X POST https://api.myapp.com/auth/forgot-password \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Password.ForgotPassword(ctx, goauth.ForgotPasswordInput{Email: "ada@example.com"})
+err := auth.Services().Password.ForgotPassword(ctx, api.ForgotPasswordInput{Email: "ada@example.com"})
 ```
 
 ---
@@ -282,7 +286,7 @@ See [Client → Forgot / reset password](./client/security.mdx#forgot-password) 
 
 ### Complete the reset — `POST /auth/reset-password`
 
-Requesting a new reset invalidates any earlier unused one for the same user — only the most recent link works. On success, **every** session for that user is revoked (there's no "except current" here, since there's no session to except), and the CSRF cookie is rotated.
+When the worker processes a new reset, it invalidates any earlier unused token for the same user — only the most recent link works. A retry can regenerate the token and send another link. On successful password replacement, **every** session for that user is revoked, and the CSRF cookie is rotated.
 
 **Request body**: `{ "code", "newPassword" }`
 
@@ -312,7 +316,7 @@ curl -X POST https://api.myapp.com/auth/reset-password \
 #### Programmatic (Go)
 
 ```go
-err := auth.Services.Password.ResetPassword(ctx, goauth.ResetPasswordInput{
+err := auth.Services().Password.ResetPassword(ctx, api.ResetPasswordInput{
     Code:        "the-code-from-the-email",
     NewPassword: "a new strong passphrase 2",
 })
@@ -371,7 +375,7 @@ curl -X POST https://api.myapp.com/auth/resend-verification \
 #### Programmatic (Go)
 
 ```go
-result, err := auth.Services.Verify.ResendVerification(ctx, userID)
+result, err := auth.Services().Verify.ResendVerification(ctx, userID)
 if err == nil && !result.Sent {
     // A usable code was already outstanding; result.ExpiresAt is its expiry.
 }
@@ -409,7 +413,7 @@ curl -X POST https://api.myapp.com/auth/verify-email/resend \
 #### Programmatic (Go)
 
 ```go
-auth.Services.Verify.SendVerificationByEmail(ctx, "ada@example.com") // error wraps a *domain.AuthError, deliberately not surfaced to the caller by the handler
+auth.Services().Verify.SendVerificationByEmail(ctx, "ada@example.com") // error wraps a *domain.AuthError, deliberately not surfaced to the caller by the handler
 ```
 
 ---

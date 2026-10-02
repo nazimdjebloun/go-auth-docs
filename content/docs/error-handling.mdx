@@ -21,10 +21,12 @@ This page covers **runtime** errors from mounted HTTP handlers. For configuratio
 
 ## Handling errors programmatically
 
-Direct service calls such as `auth.Register(...)`, `auth.Services.Auth.Login(...)`, and `auth.Services.Admin.BanUser(...)` return a normal Go `error`, not the JSON envelope. Library errors are `*domain.AuthError` values with `Code` and `Message`; they intentionally do not contain an HTTP status. The built-in handlers derive a status from `Code`.
+Import `github.com/nazimdjebloun/go-auth/api` for the operation input types in Go examples.
+
+Direct service calls such as `auth.Register(...)`, `auth.Services().Auth.Login(...)`, and `auth.Services().Admin.BanUser(...)` return a normal Go `error`, not the JSON envelope. Auth failures are `*domain.AuthError` values with `Code` and `Message`; they intentionally do not contain an HTTP status. The built-in handlers derive a status from `Code`.
 
 ```go
-result, err := auth.Services.Auth.Login(ctx, goauth.LoginInput{Email: email, Password: password})
+result, err := auth.Services().Auth.Login(ctx, api.LoginInput{Email: email, Password: password})
 if err != nil {
     if errors.Is(err, domain.ErrInvalidCredentials) {
         // matches the exported sentinel for this fixed error
@@ -39,6 +41,8 @@ if err != nil {
 ```
 
 Use `errors.Is` for one specific outcome, such as `domain.ErrInvalidCredentials`. Use `errors.As` when you need the code and message generically. This is also how the handlers map an error to a response; an error that is not a `*domain.AuthError` becomes `internal_error` (500). Prefer `errors.As` to a direct type assertion because it also finds an `*AuthError` inside a wrapped error.
+
+Login, session validation, and initial credential-token lookups distinguish an absent row from a backend failure. These backend read failures are wrapped with context while preserving the cause, so direct callers can use `errors.Is(err, context.Canceled)` or `errors.Is(err, context.DeadlineExceeded)`. Login lookup failures do not become `invalid_credentials`, and `GetSession` backend failures do not become `session_expired`. Mounted handlers return the generic `internal_error` response for backend failures. Do not assume every service error is a `*domain.AuthError`, or expose a raw backend error to clients.
 
 ## Not every layer uses this shape
 
@@ -62,7 +66,7 @@ All remaining service and handler errors use the `{"error", "message"}` envelope
 | `rate_limit_exceeded` | 429 | Too many requests, please try again later |
 | `method_disabled` | 405 | This registration method is not available |
 
-`internal_error` always means: something failed that the caller cannot fix by changing their request (a database error, a failed hash, etc.). It is logged server-side with detail; the client only ever sees the generic message.
+`internal_error` always means: something failed that the caller cannot fix by changing their request (a database error, a failed hash, etc.). It is logged server-side with detail; the client only ever sees the generic message. This includes auth-middleware failures: when session validation, transparent refresh, or the post-rotation user lookup fails because the database is unavailable (or the request context is canceled), the middleware responds `500 internal_error` — never a misleading `401`. A refresh that has already rotated the session's tokens still delivers the new `Set-Cookie` headers before that 500, so a client retry uses the current credentials instead of the pre-rotation ones.
 
 ## Authentication (register, login, session cookie)
 
@@ -75,7 +79,7 @@ All remaining service and handler errors use the `{"error", "message"}` envelope
 | `weak_password` | 400 | Password must be at least 8 characters (or the specific policy rule that failed) | From your configured `PasswordPolicy`. |
 | `invalid_email` | 400 | Invalid email format | |
 | `name_required` | 400 | Name is required | |
-| `unauthorized` | 401 | Invalid session / User not found | From the auth middleware, not a specific service call. |
+| `unauthorized` | 401 | Invalid session / User not found | From the auth middleware, not a specific service call. Only a genuine credential problem (invalid session, or the session resolved to a missing user). If the database itself fails, you get `internal_error` 500 instead — see [General](#general). |
 | `session_expired` | 401 | Missing session cookie / Session has expired | Also from the auth middleware. See [Sessions](#sessions) below for the token-level version. |
 
 ## Two-factor authentication
@@ -109,7 +113,7 @@ All remaining service and handler errors use the `{"error", "message"}` envelope
 
 | Code | Status | Message | Hint |
 |---|---|---|---|
-| `reset_token_invalid` | 400 | Invalid password reset token | |
+| `reset_token_invalid` | 400 | Invalid password reset token | Also returned if the account behind a previously issued reset token no longer has a password. |
 | `reset_token_expired` | 410 | Password reset token has expired | |
 | `reset_token_already_used` | 410 | Password reset token has already been used | |
 | `wrong_password` | 400 | Password is incorrect / Current password is incorrect | Used both by delete-account and change-password. |
@@ -118,8 +122,8 @@ All remaining service and handler errors use the `{"error", "message"}` envelope
 | `already_set` | 400 | User already has a password | The reverse case: calling set-password when one already exists. |
 | `invalid_code` | 400 | Invalid set password code | |
 | `code_used` | 400 | Set password code has already been used | |
-| `email_not_configured` | 500 | Email sender is not configured | Only reachable on the confirm-delete-account flow, which requires a mailer explicitly. |
-| `email_failed` | 500 | Failed to send reset email / Failed to send email | The token was created but delivery failed at the transport level (SMTP error, provider API error). |
+| `email_not_configured` | 500 | Email sender is not configured | Also returned by forgot-password for every submitted address when no mailer is configured. |
+| `email_failed` | 500 | Failed to send email | Used by other email flows. Forgot-password logs delivery failures and returns its generic response. |
 
 ## Account (name, deletion, email verification)
 
@@ -135,7 +139,7 @@ All remaining service and handler errors use the `{"error", "message"}` envelope
 | `code_already_used` | 410 | This code has already been used | |
 | `code_expired` | 410 | Verification code has expired | |
 | `already_verified` | 400 | Email is already verified | |
-| `email_not_found` | 200 | If an account exists, a verification email has been sent | HTTP 200 on purpose: resend-verification never reveals whether the email exists, so a non-existent address gets the same success response as a real one. |
+| `email_not_found` | 200 | If an account exists, a verification email will be sent | Public resend acknowledges queue acceptance with the same response for known and unknown addresses. Queue failure returns `internal_error` (500); delivery failures retry in the background. |
 
 ## Invites (self-service, invite-only signup)
 
@@ -200,8 +204,9 @@ The org-membership middleware (`RequireOrgMember`, `RequireOrgRole`) uses the no
 | `invalid_role` | 400 | Role must be 'user' or 'admin' | |
 | `name_required` | 400 | Name is required | |
 | `session_not_found` | 404 | Session not found | Admin revoking a specific user session that does not exist. |
-| `user_not_found` | 404 | User not found | No user with that `{id}`. Returned by detail, ban/unban, role change, delete, and the per-user session and audit-log routes. |
-| `forbidden` | 403 | You do not have permission | From `RequireRole(domain.RoleAdmin)`: a non-admin hit an admin-only route. |
+| `user_not_found` | 404 | User not found | No user with that `{id}`. Returned by detail, ban/unban, role change, delete, and the per-user session and audit-log routes. A failed database read while checking the target is `internal_error` 500, not this code. |
+| `forbidden` | 403 | You do not have permission | A non-admin hit an admin-only route. |
+| `two_factor_required` | 403 | Sign in again and complete two-factor authentication | The admin session lacks required second-factor assurance. |
 
 ## CSRF and rate limiting
 

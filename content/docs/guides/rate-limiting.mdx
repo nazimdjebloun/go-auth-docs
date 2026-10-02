@@ -56,6 +56,8 @@ goauth.WithRateLimitRoute("POST /auth/login", ratelimit.Rate{Requests: 10, Windo
 
 `ratelimit.NewMemoryStore()` is a fixed-window counter in a sharded, process-local map. It needs no configuration for one instance. It is **per-instance**, so two application instances behind a load balancer enforce an effective limit of `N × instance count`.
 
+`NewConfig` leaves the default store unallocated and starts no cleanup goroutine. Each successful `goauth.New` creates its own store after startup checks, even when you reuse the same configuration. Disabled rate limiting allocates no default store. `Auth.Close` stops only that instance's owned store; a store explicitly supplied through `WithRateLimit` or `WithRateLimitStore` is shared as supplied and remains yours to close.
+
 For multi-instance deployments, implement `ratelimit.Store` with `Allow(ctx, key, Rate) (Result, error)` against Redis or another shared backend and pass it to `WithRateLimitStore`. The store makes the allow/deny decision, allowing a distributed backend to increment and decide atomically. See [Architecture → Extension points](../architecture.mdx#extension-points).
 
 `New()` logs a one-time startup warning when rate limiting is enabled and still on this default store — it's a reminder, not a diagnosis (the library has no way to detect "multiple instances" directly), so it fires in single-instance deployments too. Pass any other `ratelimit.Store` implementation via `WithRateLimitStore` to silence it.
@@ -132,6 +134,10 @@ Every route below has a limit unless you override it; anything not listed falls 
 | `POST /auth/2fa/resend` | 3/min |
 | `POST /auth/2fa/enable` | 5/min |
 | `POST /auth/2fa/disable` | 5/min |
+| `GET /auth/oauth/*` | 10/min |
+| `POST /auth/oauth/*/link` | 10/min |
+| `GET /auth/oauth/*/callback` | 10/min |
+| `POST /auth/oauth/*/callback` | 10/min |
 | `POST /auth/orgs` | 5/hour |
 | `GET /auth/orgs/*` | 60/min |
 | `PUT /auth/orgs/*` | 10/min |
@@ -195,7 +201,7 @@ The first five responses come back `401 invalid_credentials`; the sixth is `429`
 
 #### Programmatic (Go)
 
-Calling a service method directly (`auth.Services.Auth.Login(ctx, ...)`) skips the HTTP layer entirely — rate limiting is middleware wrapped around `Handlers`, not something the service layer enforces itself. If you're driving go-auth programmatically rather than over HTTP, you're responsible for your own throttling.
+Calling a service method directly (`auth.Services().Auth.Login(ctx, ...)`) skips the HTTP layer entirely — rate limiting is part of each applicable route's wrapped handler, not something the service layer enforces itself. If you're driving go-auth programmatically rather than over HTTP, you're responsible for your own throttling.
 
 ---
 

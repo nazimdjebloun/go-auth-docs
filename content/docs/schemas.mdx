@@ -9,7 +9,7 @@ import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 # Schemas
 
 go-auth ships one canonical schema per database driver, embedded into the
-library at build time. Nine tables and around forty indexes, no ORM, no
+library at build time. Canonical SQL tables and indexes, no ORM, no
 runtime `CREATE TABLE`. You apply the schema once, before your app starts.
 
 The column tables below describe the **PostgreSQL** schema. Table and column
@@ -43,9 +43,9 @@ go run github.com/nazimdjebloun/go-auth/cmd/goauth@latest migrate \
   --driver postgres --dsn "$DATABASE_URL"
 ```
 
-The `@latest` is not optional: the CLI is its own module, so without a version
-suffix `go run` looks for the package in *your* module's dependency graph and
-fails with `no required module provides package`.
+The version suffix runs a published release independently of your project's
+dependency graph. Pin an exact root-module release for reproducibility. From
+the source checkout, use `go run ./cmd/goauth` followed by the command arguments.
 
 Both flags are required. It opens the connection, pings it, then executes each
 statement in order, printing `OK: <statement>` for each one.
@@ -96,9 +96,10 @@ Installing the CLI properly, rather than `go run`:
 go install github.com/nazimdjebloun/go-auth/cmd/goauth@latest
 ```
 
-It is a separate module with its own `go.mod`, and it blank-imports all three
-database drivers, so it works against any of them without you wiring anything
-up.
+The CLI is an executable package in the library's root module and shares its
+release version. It registers all three database drivers, so it works against
+any of them without extra driver imports. This layout applies to releases
+containing the module merge, not older published versions.
 
 Driver names accept aliases in all three routes: `postgres` or `pg`, `sqlite`
 or `sqlite3`, and `mysql`.
@@ -125,7 +126,7 @@ or `sqlite3`, and `mysql`.
 
   On PostgreSQL and SQLite every statement is `IF NOT EXISTS`, so re-running
   after you fix the cause picks up where it stopped. **MySQL is different:**
-  `CREATE INDEX` has no `IF NOT EXISTS` form there, so all 39 index statements
+  `CREATE INDEX` has no `IF NOT EXISTS` form there, so its index statements
   are unguarded and a second run fails with `Duplicate key name` on the first
   index that already exists. The tables survive. The command cannot be used
   as a no-op re-check on MySQL. Do not point it at a production database without
@@ -134,12 +135,17 @@ or `sqlite3`, and `mysql`.
 
 ## The tables
 
-Nine tables. Foreign keys to `users` are `ON DELETE CASCADE`, so deleting a
+Eleven tables. Foreign keys to `users` are `ON DELETE CASCADE`, so deleting a
 user takes their sessions, tokens, linked OAuth accounts, and org memberships
 with it. Three exceptions: `sessions.active_org_id` and
 `organizations.created_by` are `ON DELETE SET NULL` (deleting an org clears it
 from sessions pointing at it; an org outlives its creator's account), and
 `invites.created_by` declares no delete action (it does not cascade).
+
+`recovery_requests` has no account foreign key: the same row is written for
+known and unknown addresses, and the worker discards it if no eligible account
+exists when processing. Audit records and delivery obligations also remain
+independent of account deletion.
 
 No table stores a raw credential. Passwords are bcrypt or Argon2id hashes, optionally peppered before the KDF; session tokens,
 refresh tokens, verification tokens, and both kinds of invite code are stored as
@@ -148,6 +154,91 @@ SHA-256 hashes, and the raw value exists only in the response to the client.
 Each table gives a column-by-column summary. The types shown are the
 PostgreSQL ones. Each summary is followed by the exact DDL the library applies
 on each driver, indexes included.
+
+### `recovery_requests`
+
+Durable public password-reset and verification-resend requests. The public
+request writes only the supplied normalized address and operation, before any
+account lookup. No raw reset token or verification code is stored here.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `TEXT` | Application-generated request ID |
+| `kind` / `email` | `TEXT` | `password_reset` or `verification`, and the normalized address |
+| `attempts` | `INTEGER` | Incremented on each claim, including claims interrupted by a crash |
+| `available_at` | `BIGINT` | Next eligible time, UTC Unix seconds |
+| `lease_until` / `claim_owner` | `BIGINT` / `TEXT` | Two-minute lease and unique owner; stale workers cannot acknowledge a reclaimed job |
+| `dead_lettered` | `INTEGER` | `1` when processing fails after the five-attempt budget is exhausted |
+| `created_at` | `BIGINT` | UTC Unix seconds; basis for eligibility and retention |
+
+Successful processing deletes the row. Failures retry after 10, 20, 40, and 80
+seconds; delivery is at least once, so a crash after sending can cause another
+email and credential regeneration. Requests become ineligible after 24 hours.
+The minute-based cleanup deletes expired pending requests and dead letters
+older than seven days from creation, while preserving active leases.
+
+<Tabs items={['PostgreSQL', 'SQLite', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```sql
+CREATE TABLE IF NOT EXISTS recovery_requests (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    email TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at BIGINT NOT NULL,
+    lease_until BIGINT NOT NULL DEFAULT 0,
+    claim_owner TEXT NOT NULL DEFAULT '',
+    dead_lettered INTEGER NOT NULL DEFAULT 0,
+    created_at BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_requests_claim ON recovery_requests(dead_lettered, available_at, lease_until);
+CREATE INDEX IF NOT EXISTS idx_recovery_requests_created ON recovery_requests(created_at);
+```
+
+</Tab>
+<Tab value="SQLite">
+
+```sql
+CREATE TABLE IF NOT EXISTS recovery_requests (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    email TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at BIGINT NOT NULL,
+    lease_until BIGINT NOT NULL DEFAULT 0,
+    claim_owner TEXT NOT NULL DEFAULT '',
+    dead_lettered INTEGER NOT NULL DEFAULT 0,
+    created_at BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_requests_claim ON recovery_requests(dead_lettered, available_at, lease_until);
+CREATE INDEX IF NOT EXISTS idx_recovery_requests_created ON recovery_requests(created_at);
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```sql
+CREATE TABLE IF NOT EXISTS recovery_requests (
+    id VARCHAR(36) PRIMARY KEY,
+    kind VARCHAR(32) NOT NULL,
+    email VARCHAR(254) NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at BIGINT NOT NULL,
+    lease_until BIGINT NOT NULL DEFAULT 0,
+    claim_owner VARCHAR(36) NOT NULL DEFAULT '',
+    dead_lettered INTEGER NOT NULL DEFAULT 0,
+    created_at BIGINT NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE INDEX idx_recovery_requests_claim ON recovery_requests(dead_lettered, available_at, lease_until);
+CREATE INDEX idx_recovery_requests_created ON recovery_requests(created_at);
+```
+
+</Tab>
+</Tabs>
 
 ### `users`
 
@@ -292,6 +383,7 @@ One row per active login: both tokens, the device fingerprint, and the active-or
 | `last_active_at` | `TIMESTAMPTZ` | Updated on authenticated requests, subject to `TouchDebounce` |
 | `active_org_id` | `UUID` | → `organizations(id)` `ON DELETE SET NULL` |
 | `active_org_role` | `VARCHAR(50)` | |
+| `two_factor_verified_at` | `TIMESTAMPTZ` | Nullable; set only for a session created after successful 2FA. Preserved during refresh. |
 
 - On PostgreSQL a table-level `CHECK` forces `active_org_id` and `active_org_role` to be both set or both null. A session cannot be scoped to an org without a role in it.
 
@@ -316,6 +408,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_active_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     active_org_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
     active_org_role VARCHAR(50),
+    two_factor_verified_at TIMESTAMPTZ,
     CHECK ((active_org_id IS NULL AND active_org_role IS NULL) OR (active_org_id IS NOT NULL AND active_org_role IS NOT NULL))
 );
 
@@ -350,7 +443,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     revoked_at DATETIME,
     last_active_at DATETIME NOT NULL,
     active_org_id TEXT REFERENCES organizations(id) ON DELETE SET NULL,
-    active_org_role TEXT
+    active_org_role TEXT,
+    two_factor_verified_at DATETIME
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
@@ -385,6 +479,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_active_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     active_org_id VARCHAR(36),
     active_org_role VARCHAR(50),
+    two_factor_verified_at DATETIME(6),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (active_org_id) REFERENCES organizations(id) ON DELETE SET NULL
 ) ENGINE=InnoDB;
@@ -494,7 +589,9 @@ CREATE INDEX idx_verification_tokens_token_hash ON verification_tokens(token_has
 
 ### `provider_accounts`
 
-Linked OAuth identities. A user may have several.
+Linked OAuth identities. A user may have several. Provider names and subject IDs
+match case-sensitively on all drivers. MySQL uses `utf8mb4_0900_bin` for both
+columns so trailing spaces and distinct Unicode sequences also remain distinct.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -561,8 +658,8 @@ CREATE INDEX IF NOT EXISTS idx_provider_accounts_provider ON provider_accounts(p
 CREATE TABLE IF NOT EXISTS provider_accounts (
     id VARCHAR(36) PRIMARY KEY,
     user_id VARCHAR(36) NOT NULL,
-    provider VARCHAR(50) NOT NULL,
-    provider_user_id VARCHAR(255) NOT NULL,
+    provider VARCHAR(50) COLLATE utf8mb4_0900_bin NOT NULL,
+    provider_user_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
     provider_email TEXT NOT NULL,
     provider_name TEXT NOT NULL,
     avatar_url TEXT NOT NULL,
@@ -898,7 +995,7 @@ CREATE INDEX idx_org_invites_email ON organization_invites(email);
 
 ### `audit_log`
 
-Written asynchronously by the audit pipeline when it is enabled. The table name is singular `audit_log`. The admin route that reads it is `/admin/audit-logs`.
+Written in the caller's transaction by `audit.Service.Record` when audit is enabled — the record exists if and only if the state change it describes committed (record-iff-commit). Rows are insert-only and never updated. The table name is singular `audit_log`. The admin route that reads it is `/admin/audit-logs`.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -913,6 +1010,7 @@ Written asynchronously by the audit pipeline when it is enabled. The table name 
 | `created_at` | `TIMESTAMPTZ` | |
 
 - PostgreSQL additionally indexes `metadata` with a GIN index for containment queries.
+- Pre-resolution email events keep `actor_id` null and store the address in `metadata.email`; email text is never written to PostgreSQL's UUID column.
 
 <Tabs items={['PostgreSQL', 'SQLite', 'MySQL']}>
 <Tab value="PostgreSQL">
@@ -1017,9 +1115,91 @@ CREATE INDEX idx_audit_log_target_created_at ON audit_log (target_id, created_at
 </Tab>
 </Tabs>
 
+### `audit_outbox`
+
+The durable-delivery queue, created alongside `audit_log` when the embedded schema is applied. A row exists only while its event still must be delivered to an external sink: written in the same transaction as the record, deleted on successful delivery. Every retry `UPDATE`, claim, dead-letter, and eviction lands on this table — never on `audit_log`, which stays append-only and partition-friendly. `audit_log_id` deliberately has **no** foreign key (a check on the credential path would slow every login, and partition drops must not cascade); orphaned obligations are found by the janitor's periodic scan.
+
+| Column | Notes |
+|---|---|
+| `audit_log_id` | PK; the event's `id`, same dialect type as `audit_log.id` |
+| `org_id` | Tenant attribution, for per-org delivery routing |
+| `priority` | Dispatch tier: `0` critical ships first, `1` best-effort (attacker-floodable failure events like `login.failed`) |
+| `attempts` | Delivery attempts so far; at `MaxAttempts` the row is marked dead-lettered, not deleted |
+| `next_attempt_at` | Exponential-backoff schedule (10s base, capped at 1h) |
+| `claimed_at` / `claim_owner` | Claim lease for multi-instance dispatch; a stale claim is stealable (a benign duplicate under at-least-once delivery) |
+| `last_error` | Last failure, for operators |
+| `dead_lettered_at` | Terminal-failure timestamp; retained for `DeadLetterTTL` as failure evidence |
+| `created_at` | TTL basis for the `OutboxMaxAge` sweep |
+
+<Tabs items={['PostgreSQL', 'SQLite', 'MySQL']}>
+<Tab value="PostgreSQL">
+
+```sql
+CREATE TABLE IF NOT EXISTS audit_outbox (
+    audit_log_id UUID PRIMARY KEY,
+    org_id UUID,
+    priority INT NOT NULL DEFAULT 0,
+    attempts INT NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    claimed_at TIMESTAMPTZ,
+    claim_owner TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    dead_lettered_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_outbox_claim ON audit_outbox(priority, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_audit_outbox_created_at ON audit_outbox(created_at);
+```
+
+</Tab>
+<Tab value="SQLite">
+
+```sql
+CREATE TABLE IF NOT EXISTS audit_outbox (
+    audit_log_id TEXT PRIMARY KEY,
+    org_id TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    claimed_at DATETIME(6),
+    claim_owner TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    dead_lettered_at DATETIME(6),
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_outbox_claim ON audit_outbox(priority, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_audit_outbox_created_at ON audit_outbox(created_at);
+```
+
+</Tab>
+<Tab value="MySQL">
+
+```sql
+CREATE TABLE IF NOT EXISTS audit_outbox (
+    audit_log_id VARCHAR(64) PRIMARY KEY,
+    org_id VARCHAR(64),
+    priority INT NOT NULL DEFAULT 0,
+    attempts INT NOT NULL DEFAULT 0,
+    next_attempt_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    claimed_at DATETIME,
+    claim_owner VARCHAR(255) NOT NULL DEFAULT '',
+    last_error TEXT NULL,
+    dead_lettered_at DATETIME,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE INDEX idx_audit_outbox_claim ON audit_outbox(priority, next_attempt_at);
+CREATE INDEX idx_audit_outbox_created_at ON audit_outbox(created_at);
+```
+
+</Tab>
+</Tabs>
+
 ## Driver differences
 
-Three files, roughly 190 lines each, living in `internal/schema/` and embedded
+Three files living in `internal/schema/` and embedded
 by `//go:embed`. The table and column names are identical across all three.
 Only types and defaults differ.
 
@@ -1027,10 +1207,11 @@ Only types and defaults differ.
 |---|---|---|---|
 | IDs | `UUID`, defaulted by `gen_random_uuid()` | `TEXT`, generated by the application | `VARCHAR(36)`, generated by the application |
 | Timestamps | `TIMESTAMPTZ` | `DATETIME` | `DATETIME`, `DATETIME(6)` on the org tables |
+| Recovery queue times | `BIGINT` UTC Unix seconds | `BIGINT` UTC Unix seconds | `BIGINT` UTC Unix seconds |
 | Booleans | `BOOLEAN` | `INTEGER` (`0`/`1`) | `BOOLEAN` |
 | JSON columns | `JSONB` | `TEXT` | `JSON` for `metadata` and `parsed_ua` |
 | `CHECK` constraints | 7: pepper version, user role, member role, invite role, invite status, token type, and the session active-org pair | 1: pepper version only | none |
-| Indexes | 43 | 41 | 39 |
+| Indexes | 47 | 45 | 43 |
 | Re-runnable | yes: every statement is `IF NOT EXISTS` | yes | **no**: `CREATE INDEX` is unguarded |
 | Foreign keys | inline `REFERENCES` | inline `REFERENCES` | named `CONSTRAINT ... FOREIGN KEY` |
 | Timestamp precision | `TIMESTAMPTZ` | `DATETIME` | `DATETIME(6)` (microseconds) on the org tables |
