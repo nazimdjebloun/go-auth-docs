@@ -1,6 +1,7 @@
 {
   "title": "Guides",
   "pages": [
+    "integration",
     "authentication",
     "user-management",
     "sessions",
@@ -8,6 +9,7 @@
     "security",
     "oauth",
     "admin",
+    "app-permissions",
     "audit-logs",
     "deployment",
     "rate-limiting",
