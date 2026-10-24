@@ -1,0 +1,278 @@
+---
+title: Migration authoring
+description: Maintainer workflow for drafting and reviewing published auth upgrades
+---
+
+This workflow is for go-auth maintainers in a repository checkout. Applications
+use the [standalone migration workflow](./migrations). Run these commands from
+the repository root; on Windows, use WSL as required by the development guide.
+
+## Toolchain
+
+`go run ./tools/migrations` provides `draft`, `seal`, `check`, and `release`.
+It uses the existing root Go module and adds no runtime dependency on Atlas.
+Install Atlas CLI `v1.3.0` from its [official release](https://github.com/ariga/atlas/releases/tag/v1.3.0).
+The wrapper checks the release version before invoking Atlas. Both
+`atlas version v1.3.0` and `atlas community version v1.3.0` are accepted,
+including build suffixes. `--atlas` selects an executable path. A WSL user-local
+installation can use `--atlas /home/<user>/.local/bin/atlas` if that directory
+is not already on `PATH`; `atlas version` reports the installed build.
+
+Atlas failures normally report only a safe operation/failure summary. To inspect
+the failed subprocess's raw output, repeat the maintainer command with
+`--diagnostics`. This opt-in writes failed Atlas output to stderr, including
+partial output after cancellation; successful Atlas output stays internal. It
+does not print command arguments or create diagnostic log files automatically.
+Returned errors remain redacted and retain their process/cancellation causes.
+
+Use diagnostics only in a trusted maintainer terminal. Raw Atlas output may
+include reviewed SQL, development connection details or other sensitive values;
+it is deliberately not redacted. Keep it out of shared logs unless reviewed.
+
+Successful commands return stdout separately from stderr. In particular, Atlas
+notices cannot become part of the temporary SQLite HCL schema. On failure,
+opt-in diagnostics retain both output streams, including partial output.
+The CI replay step enables diagnostics because it uses public source SQL and
+pinned disposable databases, never application DSNs or application data.
+
+Programmatic maintainer callers can explicitly set `Tool.Diagnostics` to an
+`io.Writer`; its nil default suppresses raw output. A diagnostic write failure
+retains the original Atlas failure and the writer cause for inspection.
+
+On Linux/WSL amd64, the checkout includes an installer that reads the pin and
+verifies the community binary's published SHA-256 before installation:
+
+```sh
+bash tools/migrations/install-atlas.sh
+export PATH="$HOME/.local/bin:$PATH"
+atlas version
+```
+
+It requires Python 3, curl and standard Linux utilities. The default target is
+`~/.local/bin/atlas`; pass an unused executable path to select another location.
+An existing file with the same checksum is retained; a different existing file
+is refused. Other platforms can download the pinned release from Atlas directly.
+
+`internal/migrationtool/toolchain.json` pins Atlas and its disposable databases:
+
+| Dialect | Development database |
+| --- | --- |
+| PostgreSQL | `docker://postgres/18.0/dev?search_path=public` |
+| MySQL | `docker://mysql/8.4.0/dev` |
+| SQLite | `sqlite://dev?mode=memory`, using the pinned Atlas build's SQLite driver |
+
+PostgreSQL and MySQL authoring require Docker. Development URLs are fixed by the
+checked-in toolchain; the wrapper accepts no application DSN. Atlas uses these
+databases to replay history and compare it with desired SQL, then disposes of
+the development state. See [Atlas development databases](https://atlasgo.io/concepts/dev-database)
+and [versioned diff](https://atlasgo.io/versioned/diff).
+
+## Start from immutable history
+
+Choose `--base-ref` as the last published tag containing a migration catalog.
+While preparing the first migration-enabled release, use its last reviewed
+catalog commit; the default is `HEAD`. Earlier tags without a catalog cannot
+serve as an immutable-catalog reference.
+
+The tool verifies that every base migration retains its filename, SQL checksum,
+schema fixture checksum, execution mode, and data checks. It validates source
+files from the checkout, so canonical SQL may contain unreleased edits while
+the embedded runtime catalog still describes the previous release.
+
+Update the affected `internal/schema/{postgres,mysql,sqlite}.sql` files with the
+complete desired definitions. Preserve the supported snapshot formatting and
+expression subset. SQL renames and data transformations need explicit review.
+
+## Draft one release step
+
+For example, after making a schema change:
+
+```sh
+go run ./tools/migrations draft \
+  --driver postgres --release v0.5.0 --step 1 \
+  --base-ref HEAD --out .migration-drafts/postgres
+```
+
+The tool copies the published numbered SQL into a temporary Atlas history,
+retaining the original numeric version prefixes. It creates an Atlas integrity
+file there and runs `atlas migrate diff` against the updated canonical SQL.
+Atlas's temporary timestamp filename becomes the proposed next auth ID, such
+as `000002_v0.5.0_001.sql`; published files retain their existing names.
+
+For SQLite, the wrapper inspects the desired SQL into temporary HCL and omits
+SQLite-generated UNIQUE index names from that input. This avoids a pinned Atlas
+normalization mismatch while preserving uniqueness, index parts, predicates,
+and explicit index names. Published SQL and verification snapshots are unchanged.
+
+Each generated command has an explicit `-- goauth:statement` boundary. The
+wrapper requests these boundaries directly from Atlas's plan formatter and
+preserves each command intact, including compound SQL. See the
+[pinned formatter implementation](https://github.com/ariga/atlas/blob/v1.3.0/cmd/atlas/internal/cmdapi/migrate.go).
+
+The new review directory contains:
+
+```text
+.migration-drafts/postgres/
+  migration.sql  # reviewed DDL and required data transformations
+  schema.sql     # frozen complete desired definition for this step
+  draft.json     # ID, release, inputs, execution mode and data checks
+```
+
+The tool refuses to overwrite an existing directory. Choose a new directory
+when inputs change. An unchanged schema produces no draft. For required data
+work or a rename whose intent needs manual SQL, use `draft --manual` to create
+a skeleton, then replace its comment with executable SQL.
+
+## Review and seal
+
+Review `migration.sql` and `draft.json` together. Add backfills, conversions,
+deployment prerequisites, and recovery instructions as needed. Each statement
+must retain its boundary; the reserved marker cannot appear in a statement
+body. Do not use transaction-control SQL: execution mode belongs in metadata.
+
+`transactional` defaults to true for PostgreSQL/SQLite and false for MySQL.
+Set it false for PostgreSQL operations such as concurrent index creation.
+SQLite steps remain transactional. Set `sqliteRebuild` true for SQLite table
+replacements that require foreign keys disabled before the runner's transaction.
+The replay copy uses Atlas directives and SQLite connection settings suitable
+for those steps; it leaves the published SQL unchanged.
+
+Add required data postconditions to `checks`. Each query must be a `SELECT`
+returning exactly one true boolean. For example, a replacement password column
+needs a check that every password-bearing account has its intended value while
+OAuth-only accounts remain valid. Matching the table definition alone cannot
+establish this. Never regenerate hashes, tokens, pepper versions or encrypted
+credential material through a structural diff.
+
+Use `preconditions` for required starting-data predicates. In the Go runner,
+they run before the step's started record and SQL, returning exactly one true
+value per `SELECT`.
+Describe unavailable external keys or operator input in deployment instructions;
+SQL checks cannot establish the presence of material outside the database.
+
+Only a nontransactional upgrade may opt into full replay through a `retry` object:
+
+```json
+{
+  "checks": ["SELECT COUNT(*)=0 FROM users WHERE password_hash IS NOT NULL AND password_hash = ''"],
+  "instructions": "Inspect the failure, reconcile schema and data to the documented starting state, and verify all external effects before retrying."
+}
+```
+
+This is the shape of `retry`, not a complete draft or a sufficient policy for
+every migration. Its nonempty `checks` also run before initial execution. Author
+checks covering the data conditions that make full replay valid, with specific
+recovery instructions; do not use an unconditional true value as evidence of
+recovered data. `retry` verifies the previous completed structural snapshot and
+data postconditions before these checks, replays only this step, and retains its
+original started record. Partial schema changes require reviewed reconciliation
+first. Baselines and transactional steps cannot publish retry policies. Cover
+failed prerequisites, partial DDL, failed retries, and concurrent retry attempts
+on each applicable actual engine before releasing such a policy. Unknown catalog
+fields and changed exported execution metadata are rejected.
+
+After review:
+
+```sh
+go run ./tools/migrations seal \
+  --draft .migration-drafts/postgres --reviewed --base-ref HEAD
+```
+
+`seal` checks that the catalog and canonical inputs still match the reviewed
+draft. It validates the candidate catalog, then replays the complete candidate
+history through Atlas in the pinned disposable database. A remaining structural
+diff stops publication. `seal` does not run the Go runner or execute its
+preconditions and data postconditions. On success it appends:
+
+```text
+internal/migrations/postgres/
+  000002_v0.5.0_001.sql
+  schema_000002.sql
+  catalog.json
+```
+
+The full `schema_000002.sql` fixture records the expected structure after that
+step. The runner uses it for verification, adoption and recovery as applicable;
+it stays internal. Applications still export one `auth.schema.sql` plus their
+published migration files.
+
+Repeat for affected dialects. For multiple steps in one release, seal the first
+intermediate target, update canonical SQL for the next target, then draft with
+the next `--step`. Numeric migration IDs establish ordering across releases.
+Every step has its own expected structure and required data postconditions.
+
+The full backend suites require
+`TestSelectedBackendPublishedCatalogUpgradePrefixes` on SQLite, PostgreSQL and
+MySQL. In a fresh database for every published prefix, including bootstrap and
+latest, it installs that prefix through the actual Go runner using the original
+embedded SQL and verification snapshots, upgrades to the current target through
+`Apply`, runs `Verify`, and requires a no-op repeat apply. It preserves published
+artifact checksums and asserts that completed journal records survive with no
+pending or dirty state.
+This test is excluded from stress runs.
+
+Atlas's empty structural replay and the every-prefix Go test serve different
+checks. The Go test exercises execution metadata, preconditions, data
+postconditions and journal transitions, starting without application data.
+For each published schema or data change, also add populated upgrade coverage
+for supported starting revisions, skipped releases, credential/token
+preservation, failures and recovery. Existing synthetic runner fixtures do not
+replace those per-change tests. SQLite rebuild coverage must include
+application-owned child tables. Run the actual engine suites before advertising
+a new supported upgrade path.
+
+## Finish the release
+
+Once each dialect reaches its desired target:
+
+```sh
+go run ./tools/migrations release --release v0.5.0 --base-ref HEAD
+go run ./tools/migrations check --base-ref HEAD --published --release v0.5.0 --replay
+```
+
+`release` updates library-release metadata for all dialects and retains their
+existing revisions and migration identities. A release with no schema or data
+changes uses these commands without creating empty migration files. `check`
+requires matching canonical targets, a preserved immutable prefix, consistent
+library-release metadata and no undeclared artifacts. The default check needs Git,
+but neither Atlas nor a database.
+
+`--published` verifies every fetched semantic-version tag containing migration
+catalogs; fetch full tag history for this check. Tags predating all three catalogs
+are skipped. A partially published dialect catalog, changed frozen metadata or
+artifacts, or a catalog release label differing from its tag is rejected.
+`--release` requires all current catalogs to declare the selected library version.
+`--replay` uses pinned Atlas and disposable databases to replay all three histories
+and require no remaining structural diff. It does not write source artifacts or
+run the Go runner's preconditions or data postconditions, or upgrade an application
+database. Empty-schema replay cannot validate populated credential data; the
+actual-engine upgrade suites remain required.
+
+The CI `migration-catalog` job checks the PR base or previous push when it contains
+a catalog, every fetched migration-enabled release tag, and the declared library
+version on version-tag pushes. It also installs checksum-verified pinned Atlas
+and replays all dialects. Before the first catalog exists on the base, CI checks
+the new catalog against `HEAD` and any available published catalogs.
+
+Check against the last published migration-enabled tag again before release;
+`HEAD` alone protects committed history in the current checkout. Review and
+commit canonical schemas, numbered SQL, fixtures, catalog metadata, tests and
+deployment documentation together. The authoring tool does not commit, tag or
+push, and does not execute upgrades against application databases.
+
+## Interrupted authoring
+
+Source publication and release metadata updates hold `.migration-author.lock`.
+Before sealing, the tool rechecks catalog, canonical, draft metadata, SQL and
+snapshot inputs after Atlas replay. Edits made during that replay stop publication
+and remain in the checkout for review. Cancellation before publication also stops
+sealing or draft publication.
+If a maintainer process crashes, inspect its PID and working tree before removing
+the stale lock. A crash during publication may leave a numbered SQL or fixture
+file outside the catalog; `check` reports it. Reconcile those local artifacts
+against the reviewed draft before continuing. A crash during the three release
+metadata replacements may leave different release labels; rerunning `release`
+after inspection restores consistent metadata without changing migration IDs.
+
+Drafts live in ignored `.migration-drafts/`. They describe reviewed source inputs,
+and have no role in a deployment's applied-state journal.

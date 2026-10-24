@@ -10,6 +10,10 @@ go-auth is a library that handles the boring, easy-to-get-wrong parts of auth, r
 
 ## Getting it running
 
+Apply [auth migrations](/docs/migrations) before starting the application.
+The production example below also requires `myMailer`, a configured
+`port.Mailer`; [Installation](/docs/installation) covers the setup.
+
 ```go
 cfg, err := goauth.NewConfig(
     goauth.WithApp(goauth.AppConfig{
@@ -25,6 +29,7 @@ cfg, err := goauth.NewConfig(
     goauth.WithSecurity(goauth.SecurityConfig{
         AllowedOrigins: []string{"https://myapp.com"},
     }),
+    goauth.WithMailer(myMailer),
 )
 if err != nil {
     log.Fatal(err)
@@ -43,7 +48,7 @@ That gives you email and password login with verification and reset flows, OAuth
 
 ## How it's put together
 
-Everything sits behind plain interfaces: `port.Mailer`, `port.Hasher`, `port.OAuthProvider`. The core logic never imports `net/http` or `database/sql` directly.
+Services use plain interfaces such as `port.Mailer`, `port.Hasher`, and `port.OAuthProvider`, with separate HTTP routing and SQL persistence implementations.
 
 That isn't architecture for its own sake. It means the login flow is testable without a database, your mailer in tests is a struct that appends to a slice, and swapping SQLite for Postgres is a config change rather than a rewrite. The [Architecture](/docs/architecture) page walks through the actual layout.
 
@@ -59,7 +64,7 @@ No third-party security audit.
 
 ## What it doesn't do yet
 
-Sessions and rate limit state live in memory right now. That's fine on a single instance, and wrong the moment you run two, so if you're already behind a load balancer, this isn't ready for you yet. A store backed by Redis is the fix, and it's the next thing I'm building.
+Sessions are persisted in the application database. The default route rate-limit store is in memory and applies limits per instance. For shared limits across instances, supply a shared store through `WithRateLimitStore`; see [Rate limiting](/docs/guides/rate-limiting) and [Integration](/docs/guides/integration) for deployment and ownership details.
 
 It's also not at version 1.0 yet, so the API can still change.
 

@@ -55,7 +55,7 @@ const features = [
   {
     icon: '▤',
     title: 'Audit Logging',
-    description: 'Opt in with one flag for an async, non-blocking event pipeline with pluggable sinks — Kafka, NATS, a webhook, or your own.',
+    description: 'Opt in to database-backed audit records and an outbox, with background delivery to pluggable sinks.',
   },
   {
     icon: '✉',
@@ -122,9 +122,14 @@ export default function HomePage() {
 
         {/* Code Snippets */}
         <section className="max-w-4xl mx-auto px-6 pb-24 sm:pb-32">
+          <p className="mb-6 text-sm text-gray-700 dark:text-white/60">
+            Run <Link href="/docs/migrations" className="underline underline-offset-4">auth migrations</Link> before starting the app;
+            {' '}<code>New</code> never runs them. Production examples also need a configured
+            {' '}<Link href="/docs/installation" className="underline underline-offset-4">mailer</Link> for email features.
+          </p>
           <Tabs items={['App', 'Provider', 'Session', 'Database', 'Security', 'Organizations']}>
             <Tab>
-              <DynamicCodeBlock lang="go" code={`// The three required options — everything else has a default.
+              <DynamicCodeBlock lang="go" code={`// Required app, secret, origin, and production mailer configuration.
 cfg, err := goauth.NewConfig(
     goauth.WithApp(goauth.AppConfig{
         Name:    "MyApp",
@@ -143,6 +148,8 @@ cfg, err := goauth.NewConfig(
     goauth.WithSecurity(goauth.SecurityConfig{
         AllowedOrigins: []string{"https://myapp.com"},
     }),
+
+    goauth.WithMailer(myMailer), // your configured port.Mailer
 )
 if err != nil {
     log.Fatal(err)
