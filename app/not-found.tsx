@@ -2,7 +2,12 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useEffect, useState } from 'react';
+import { useSyncExternalStore } from 'react';
+
+function subscribeToHistory(onChange: () => void) {
+  window.addEventListener('popstate', onChange);
+  return () => window.removeEventListener('popstate', onChange);
+}
 
 // Client component because "Go back" needs router.back(), which only exists
 // on the client. The rest could be static, but splitting the page in two to
@@ -10,14 +15,13 @@ import { useEffect, useState } from 'react';
 export default function NotFound() {
   const router = useRouter();
 
-  // history.length is only readable in the browser, and reading it during
-  // render would desync server and client markup. Resolving it in an effect
-  // keeps the first paint identical on both, then hides the back button if
-  // this tab has nowhere to go back to (a pasted link, a fresh tab).
-  const [canGoBack, setCanGoBack] = useState(false);
-  useEffect(() => {
-    setCanGoBack(window.history.length > 1);
-  }, []);
+  // The server snapshot keeps hydration consistent; the browser snapshot
+  // shows the back button only when this tab has a previous history entry.
+  const canGoBack = useSyncExternalStore(
+    subscribeToHistory,
+    () => window.history.length > 1,
+    () => false,
+  );
 
   return (
     <>
